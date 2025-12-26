@@ -1,0 +1,18 @@
+# INSTRUÇÕES PARA CONFIGURAR A CHAVE DA API
+
+1. Crie um arquivo chamado ".env" na raiz do projeto (mesmo diretório onde está o app.py)
+
+2. Adicione a seguinte linha no arquivo .env:
+   GOOGLE_API_KEY=sua_chave_aqui
+
+3. Para obter uma chave da API Google Gemini:
+   - Acesse: https://makersuite.google.com/app/apikey
+   - Faça login com sua conta Google
+   - Clique em "Create API Key"
+   - Copie a chave gerada
+   - Cole no arquivo .env substituindo "sua_chave_aqui"
+
+4. Salve o arquivo .env
+
+5. Execute novamente: python -m streamlit run app.py
+
