@@ -52,40 +52,83 @@ with st.sidebar:
             st.markdown("### 👤 Cliente Autenticado")
             st.write(f"**Nome:** {cliente.get('nome', 'N/A')}")
             st.write(f"**CPF:** {cliente.get('cpf', 'N/A')}")
-            st.write(f"**Limite:** R$ {float(cliente.get('limite_credito', 0)):,.2f}")
-            # Score removido da interface para manter sigilo (boa prática bancária)
+            st.write(f"**Limite Atual:** R$ {float(cliente.get('limite_credito', 0)):,.2f}")
+            
+            # Mostra score e limite máximo se disponível (após entrevista)
+            if "ultimo_resultado" in st.session_state:
+                resultado = st.session_state.ultimo_resultado
+                if resultado.get("score_calculado"):
+                    st.markdown("---")
+                    st.markdown("### 📊 Resultado da Entrevista")
+                    st.success(f"**Score:** {resultado['score_calculado']} pontos")
+                    if resultado.get("limite_maximo"):
+                        st.info(f"**Limite Máximo:** R$ {resultado['limite_maximo']:,.2f}")
     
     st.markdown("---")
     
-    # Seção de Debug da IA (sempre visível)
+    # Seção de Debug da IA
     st.header("🔍 Debug da IA")
     
-    # Inicializa debug_info na sessão se não existir
+    # Inicializa debug_info e índice na sessão
     if "debug_info" not in st.session_state:
         st.session_state.debug_info = []
+    if "debug_idx" not in st.session_state:
+        st.session_state.debug_idx = 0
     
-    # Mostra informações de debug da última interação
-    with st.expander("📋 Ver Prompts e Respostas da IA", expanded=True):
-        if st.session_state.debug_info:
-            for idx, debug in enumerate(st.session_state.debug_info):
-                st.markdown(f"**### Chamada {idx + 1}**")
-                
-                if debug.get("contexto"):
-                    st.markdown(f"**Contexto:** `{debug['contexto']}`")
-                
-                st.markdown("**Prompt enviado para a IA:**")
-                st.code(debug.get("prompt", "N/A"), language="text")
-                
-                if debug.get("erro"):
-                    st.error(f"**❌ Erro:** {debug['erro']}")
-                else:
-                    st.markdown("**Resposta da IA:**")
-                    st.code(debug.get("resposta", "N/A"), language="text")
-                
-                if idx < len(st.session_state.debug_info) - 1:
-                    st.markdown("---")
+    if st.session_state.debug_info:
+        total = len(st.session_state.debug_info)
+        
+        # Navegação
+        col1, col2, col3 = st.columns([1, 2, 1])
+        
+        with col1:
+            if st.button("◀ Anterior", disabled=st.session_state.debug_idx <= 0):
+                st.session_state.debug_idx -= 1
+                st.rerun()
+        
+        with col2:
+            # Atualiza índice para o último se necessário
+            if st.session_state.debug_idx >= total:
+                st.session_state.debug_idx = total - 1
+            st.markdown(f"**Chamada {st.session_state.debug_idx + 1} de {total}**")
+        
+        with col3:
+            if st.button("Próxima ▶", disabled=st.session_state.debug_idx >= total - 1):
+                st.session_state.debug_idx += 1
+                st.rerun()
+        
+        # Botão para ir direto ao último
+        if st.button("⏭️ Ir para última chamada"):
+            st.session_state.debug_idx = total - 1
+            st.rerun()
+        
+        # Mostra chamada selecionada
+        debug = st.session_state.debug_info[st.session_state.debug_idx]
+        
+        # Info compacta
+        modelo = debug.get("modelo_usado", "N/A")
+        tempo = debug.get("tempo_ms", 0)
+        st.caption(f"🤖 `{modelo}` | ⏱️ {tempo}ms")
+        
+        if debug.get("contexto"):
+            st.caption(f"📍 {debug['contexto']}")
+        
+        # Tool calls
+        tool_calls = debug.get("tool_calls", [])
+        if tool_calls:
+            st.success(f"🔧 Tools: {', '.join(tool_calls)}")
+        
+        # Prompt e resposta em expanders
+        with st.expander("📤 Ver Prompt", expanded=False):
+            st.code(debug.get("prompt", "N/A"), language="text")
+        
+        if debug.get("erro"):
+            st.error(f"❌ {debug['erro']}")
         else:
-            st.info("ℹ️ Nenhuma chamada à IA ainda. Envie uma mensagem para ver os prompts e respostas.")
+            with st.expander("📥 Ver Resposta", expanded=True):
+                st.code(debug.get("resposta", "N/A"), language="text")
+    else:
+        st.info("ℹ️ Nenhuma chamada à IA ainda.")
     
     st.markdown("---")
     
@@ -94,6 +137,8 @@ with st.sidebar:
         st.session_state.mensagens = []
         st.session_state.encerrado = False
         st.session_state.debug_info = []
+        st.session_state.debug_idx = 0
+        st.session_state.ultimo_resultado = {}
         st.rerun()
     
     st.markdown("---")
@@ -145,6 +190,11 @@ else:
                 st.session_state.debug_info.extend(resultado["debug_info"])
             else:
                 st.session_state.debug_info = resultado["debug_info"]
+            # Move índice para a última chamada
+            st.session_state.debug_idx = len(st.session_state.debug_info) - 1
+        
+        # Salva resultado para mostrar score/limite no sidebar
+        st.session_state.ultimo_resultado = resultado
         
         # Se houve erro, mostra alerta
         if resultado.get("erro"):

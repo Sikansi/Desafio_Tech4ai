@@ -1,10 +1,13 @@
 """
-Classe base para todos os agentes
+Classe base para todos os agentes - Refatorada com Tool Calling nativo e Memória
 """
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, List
-from langchain_core.messages import HumanMessage, AIMessage
+from typing import Dict, Any, Optional, List, Callable
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.chat_history import InMemoryChatMessageHistory
+from langchain_core.tools import tool
+import time
 
 
 class BaseAgent(ABC):
@@ -13,34 +16,21 @@ class BaseAgent(ABC):
     # Cache compartilhado de modelos esgotados (compartilhado entre todas as instâncias)
     _modelos_esgotados_compartilhado = set()
     
-    # Lista ordenada de modelos por preferência (do melhor para o pior)
-    # Ordem baseada em: qualidade, estabilidade, velocidade e limites de quota
-    # ATUALIZADO: Apenas modelos que realmente existem na API (verificado com listar_modelos.py)
+    # Memória compartilhada entre agentes (para manter contexto na troca)
+    _memoria_compartilhada = None
+    
+    # Lista ordenada de modelos - vai direto para lite quando quota esgota
+    # Modelos da mesma família compartilham quota, então pulamos para lite direto
     MODELOS_FALLBACK = [
-        # Modelos mais recentes e estáveis (prioridade máxima)
-        "gemini-2.5-flash",           # Mais recente, rápido, estável (recomendado)
-        "gemini-2.5-pro",             # Mais recente Pro, muito capaz
-        
-        # Modelos 2.0 estáveis
-        "gemini-2.0-flash-001",       # Estável, rápido
-        "gemini-2.0-flash",           # Versão atual, rápido
-        
-        # Modelos "latest" (sempre atualizados)
-        "gemini-pro-latest",          # Última versão Pro
-        "gemini-flash-latest",        # Última versão Flash
-        
-        # Modelos Flash Lite (mais leves, podem ter limites maiores)
-        "gemini-2.5-flash-lite",      # Versão lite 2.5, mais leve
-        "gemini-2.0-flash-lite-001",  # Flash Lite estável
-        "gemini-2.0-flash-lite",      # Flash Lite atual
-        "gemini-flash-lite-latest",   # Última versão Flash Lite
-        
-        # Modelos Gemma (open source, podem ter limites diferentes)
-        "gemma-3-27b-it",            # Maior modelo Gemma
-        "gemma-3-12b-it",            # Modelo médio Gemma
-        "gemma-3-4b-it",             # Modelo pequeno Gemma
-        "gemma-3-1b-it",             # Modelo muito pequeno Gemma
+        "gemini-2.5-flash",           # Principal
+        "gemini-2.5-flash-lite",      # Fallback direto (lite tem quota separada)
+        "gemini-2.0-flash",           # Alternativa
+        "gemini-2.0-flash-lite",      # Alternativa lite
     ]
+    
+    # Timeout em segundos para chamadas à API
+    # Gemini exige mínimo de 10 segundos
+    REQUEST_TIMEOUT = 10
     
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
         """
@@ -48,8 +38,7 @@ class BaseAgent(ABC):
         
         Args:
             api_key: Chave da API do Google Gemini
-            model: Nome do modelo a ser usado (padrão: gemini-2.5-flash ou da variável GEMINI_MODEL)
-                   Use o script listar_modelos.py para ver modelos disponíveis
+            model: Nome do modelo a ser usado
         """
         import os
         
@@ -67,68 +56,88 @@ class BaseAgent(ABC):
         
         # Garante que o modelo inicial está na lista de fallback
         if model not in self.MODELOS_FALLBACK:
-            # Adiciona no início da lista se não estiver
             self.MODELOS_FALLBACK.insert(0, model)
         
-        # Usa cache compartilhado de modelos esgotados (compartilhado entre todas as instâncias)
+        # Usa cache compartilhado de modelos esgotados
         self.modelos_esgotados = BaseAgent._modelos_esgotados_compartilhado
         
-        # Índice do modelo atual na lista de fallback
-        # Se o modelo inicial já está esgotado, procura o primeiro disponível
-        if model in self.MODELOS_FALLBACK:
-            idx_inicial = self.MODELOS_FALLBACK.index(model)
-        else:
-            idx_inicial = 0
+        # Procura o primeiro modelo disponível (não esgotado)
+        self.modelo_atual = self._encontrar_modelo_disponivel(model)
+        self.modelo_atual_idx = self.MODELOS_FALLBACK.index(self.modelo_atual) if self.modelo_atual in self.MODELOS_FALLBACK else 0
         
-        # Procura o primeiro modelo disponível (não esgotado) a partir do índice inicial
-        modelo_encontrado = False
-        for idx in range(idx_inicial, len(self.MODELOS_FALLBACK)):
-            modelo_candidato = self.MODELOS_FALLBACK[idx]
-            if modelo_candidato not in self.modelos_esgotados:
-                self.modelo_atual_idx = idx
-                self.modelo_atual = modelo_candidato
-                modelo_encontrado = True
-                break
-        
-        # Se não encontrou nenhum disponível, usa o primeiro mesmo (vai tentar e falhar)
-        if not modelo_encontrado:
-            self.modelo_atual_idx = idx_inicial
-            self.modelo_atual = self.MODELOS_FALLBACK[idx_inicial]
-        
-        # Inicializa o LLM com o modelo escolhido
+        # Inicializa o LLM com timeout curto
         self.llm = self._criar_llm(self.modelo_atual)
         
-        self.historico = []
-        self.debug_info = []  # Armazena informações de debug (prompts e respostas do LLM)
+        # LLM com tools (será configurado por cada agente)
+        self.llm_with_tools = None
+        self.tools = []
+        self.tools_by_name = {}
+        
+        # Inicializa memória compartilhada se não existir
+        if BaseAgent._memoria_compartilhada is None:
+            BaseAgent._memoria_compartilhada = InMemoryChatMessageHistory()
+        self.memory = BaseAgent._memoria_compartilhada
+        
+        # Debug info (apenas para a sessão atual)
+        self.debug_info = []
+    
+    def _encontrar_modelo_disponivel(self, modelo_preferido: str) -> str:
+        """Encontra o primeiro modelo disponível que não está esgotado"""
+        # Tenta o modelo preferido primeiro
+        if modelo_preferido not in self.modelos_esgotados:
+            return modelo_preferido
+        
+        # Procura na lista de fallback
+        for modelo in self.MODELOS_FALLBACK:
+            if modelo not in self.modelos_esgotados:
+                return modelo
+        
+        # Se todos estão esgotados, retorna o preferido mesmo (vai falhar mas é melhor que nada)
+        return modelo_preferido
     
     def _criar_llm(self, model: str) -> ChatGoogleGenerativeAI:
-        """Cria uma instância do LLM com o modelo especificado"""
+        """Cria uma instância do LLM com o modelo especificado e timeout curto"""
         return ChatGoogleGenerativeAI(
             model=model,
             google_api_key=self.api_key,
-            temperature=0.7
+            temperature=0.7,
+            request_timeout=self.REQUEST_TIMEOUT,  # Timeout curto!
         )
+    
+    def registrar_tools(self, tools: List[Callable]):
+        """
+        Registra ferramentas (tools) para o agente usar.
+        Deve ser chamado após __init__ por cada agente específico.
+        
+        Args:
+            tools: Lista de funções decoradas com @tool
+        """
+        self.tools = tools
+        self.tools_by_name = {t.name: t for t in tools}
+        self.llm_with_tools = self.llm.bind_tools(tools)
     
     def _trocar_modelo(self) -> bool:
         """
         Tenta trocar para o próximo modelo disponível da lista de fallback.
-        Pula modelos que já estão esgotados (cache compartilhado).
-        
-        Returns:
-            True se conseguiu trocar, False se não há mais modelos disponíveis
+        Retorna True se conseguiu trocar, False se não há mais modelos.
         """
-        # Marca o modelo atual como esgotado no cache compartilhado
+        # Marca o modelo atual como esgotado
         modelo_anterior = self.modelo_atual
         self.modelos_esgotados.add(self.modelo_atual)
         
-        # Procura o próximo modelo disponível (não esgotado)
+        # Procura o próximo modelo disponível
         for idx in range(self.modelo_atual_idx + 1, len(self.MODELOS_FALLBACK)):
             modelo_candidato = self.MODELOS_FALLBACK[idx]
             if modelo_candidato not in self.modelos_esgotados:
                 self.modelo_atual_idx = idx
                 self.modelo_atual = modelo_candidato
                 self.llm = self._criar_llm(self.modelo_atual)
-                print(f"[GATEWAY] Modelo trocado de {modelo_anterior} para: {self.modelo_atual} (modelos esgotados: {len(self.modelos_esgotados)})")
+                
+                # Atualiza LLM com tools se existirem
+                if self.tools:
+                    self.llm_with_tools = self.llm.bind_tools(self.tools)
+                
+                print(f"[GATEWAY] Modelo trocado: {modelo_anterior} → {self.modelo_atual}")
                 return True
         
         return False
@@ -138,160 +147,265 @@ class BaseAgent(ABC):
         error_str = str(error)
         return "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower()
     
-    def adicionar_mensagem(self, mensagem: str, tipo: str = "human"):
-        """Adiciona mensagem ao histórico"""
-        if tipo == "human":
-            self.historico.append(HumanMessage(content=mensagem))
-        else:
-            self.historico.append(AIMessage(content=mensagem))
+    def obter_historico_memoria(self) -> List:
+        """Obtém histórico de mensagens da memória"""
+        return self.memory.messages if self.memory.messages else []
     
-    def limpar_historico(self):
-        """Limpa o histórico de mensagens"""
-        self.historico = []
+    def adicionar_a_memoria(self, mensagem_usuario: str, resposta_ia: str):
+        """Adiciona interação à memória compartilhada"""
+        self.memory.add_user_message(mensagem_usuario)
+        self.memory.add_ai_message(resposta_ia)
+    
+    def limpar_memoria(self):
+        """Limpa a memória de conversa"""
+        self.memory.clear()
         self.debug_info = []
-        # Não limpa modelos_esgotados - mantém durante toda a sessão
     
     def resetar_debug_info(self):
-        """Limpa apenas as informações de debug (mantém histórico e modelos esgotados)"""
+        """Limpa apenas as informações de debug"""
         self.debug_info = []
     
     def obter_debug_info(self) -> list:
-        """Retorna informações de debug (prompts e respostas do LLM)"""
+        """Retorna informações de debug"""
         return self.debug_info
     
     @abstractmethod
     def processar(self, mensagem: str, contexto: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Processa uma mensagem do usuário
-        
-        Args:
-            mensagem: Mensagem do usuário
-            contexto: Contexto da conversa (dados do cliente, estado, etc)
-            
-        Returns:
-            Dict com resposta e informações de controle
-        """
+        """Processa uma mensagem do usuário"""
         pass
     
-    def gerar_resposta(self, prompt: str, contexto_adicional: str = "", usar_historico: bool = True) -> str:
+    def _extrair_texto_resposta(self, content: Any) -> str:
         """
-        Gera resposta usando o LLM com fallback automático de modelos.
-        Se o modelo atual atingir o limite de quota, tenta automaticamente o próximo modelo da lista.
+        Extrai texto da resposta do LLM, que pode vir em diferentes formatos.
         
         Args:
-            prompt: Prompt a ser enviado ao LLM
-            contexto_adicional: Informação adicional para debug (ex: nome da função que chamou)
-            usar_historico: Se True, usa o histórico de mensagens. Se False, envia apenas o prompt atual.
+            content: Conteúdo da resposta (pode ser str, list, ou None)
+            
+        Returns:
+            Texto extraído como string
         """
-        # Prepara mensagens: usa histórico apenas se solicitado e se não estiver vazio
-        if usar_historico and self.historico:
-            mensagens = self.historico + [HumanMessage(content=prompt)]
-        else:
-            # Envia apenas o prompt atual, sem histórico
-            mensagens = [HumanMessage(content=prompt)]
+        if content is None:
+            return ""
         
-        tentativas = 0
+        if isinstance(content, str):
+            return content
+        
+        if isinstance(content, list):
+            # Formato: [{'type': 'text', 'text': '...'}, ...]
+            textos = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    textos.append(item.get("text", ""))
+                elif isinstance(item, str):
+                    textos.append(item)
+            return " ".join(textos)
+        
+        # Tenta converter para string
+        return str(content)
+    
+    def invocar_llm(self, mensagens: List, contexto_debug: str = "") -> Any:
+        """
+        Invoca o LLM com fallback automático de modelos.
+        Usa timeout curto para falhar rápido em erros de quota.
+        
+        Args:
+            mensagens: Lista de mensagens para enviar ao LLM
+            contexto_debug: Contexto para debug
+            
+        Returns:
+            Resposta do LLM
+        """
         max_tentativas = len(self.MODELOS_FALLBACK)
+        tentativas = 0
         
         while tentativas < max_tentativas:
+            # Verifica se modelo atual está esgotado antes de tentar
+            if self.modelo_atual in self.modelos_esgotados:
+                if not self._trocar_modelo():
+                    raise Exception("Todos os modelos estão esgotados.")
+                continue
+            
             try:
-                # Verifica se o modelo atual já está esgotado antes de tentar
-                if self.modelo_atual in self.modelos_esgotados:
-                    if not self._trocar_modelo():
-                        raise Exception("Todos os modelos disponíveis estão esgotados.")
-                    continue
+                inicio = time.time()
                 
-                resposta = self.llm.invoke(mensagens)
-                resposta_content = resposta.content
+                # Usa LLM com tools se disponível, senão usa LLM normal
+                llm_to_use = self.llm_with_tools if self.llm_with_tools else self.llm
+                resposta = llm_to_use.invoke(mensagens)
                 
-                # Armazena informações de debug
+                tempo = time.time() - inicio
+                
+                # Extrai texto da resposta de forma segura
+                texto_resposta = self._extrair_texto_resposta(resposta.content)
+                
+                # Log de debug
+                prompt_resumo = str(mensagens[-1].content)[:200] if mensagens else ""
                 self.debug_info.append({
-                    "contexto": contexto_adicional,
-                    "prompt": prompt,
-                    "resposta": resposta_content,
+                    "contexto": contexto_debug,
+                    "prompt": prompt_resumo,
+                    "resposta": texto_resposta[:200] if texto_resposta else "[tool_calls]",
+                    "tool_calls": [tc["name"] for tc in resposta.tool_calls] if resposta.tool_calls else [],
                     "modelo_usado": self.modelo_atual,
+                    "tempo_ms": int(tempo * 1000),
                     "erro": None
                 })
                 
-                return resposta_content
+                return resposta
                 
             except Exception as e:
                 tentativas += 1
                 
-                # Verifica se é erro de quota excedida
                 if self._is_quota_exceeded_error(e):
-                    # Marca modelo como esgotado e tenta trocar imediatamente
+                    # Troca de modelo é instantânea
                     if self._trocar_modelo():
-                        # Tenta novamente com o novo modelo (sem delay)
                         continue
                     else:
-                        # Não há mais modelos disponíveis
-                        erro_final = f"Todos os modelos atingiram o limite de quota. Modelos esgotados: {', '.join(self.modelos_esgotados)}"
+                        erro = f"Todos os modelos esgotados: {', '.join(self.modelos_esgotados)}"
                         self.debug_info.append({
-                            "contexto": contexto_adicional,
-                            "prompt": prompt,
+                            "contexto": contexto_debug,
+                            "prompt": str(mensagens[-1].content)[:200] if mensagens else "",
                             "resposta": None,
+                            "tool_calls": [],
                             "modelo_usado": self.modelo_atual,
-                            "erro": erro_final
+                            "tempo_ms": 0,
+                            "erro": erro
                         })
-                        raise Exception(f"Erro ao chamar LLM: {erro_final}")
+                        raise Exception(erro)
                 else:
-                    # Erro não relacionado a quota, não tenta trocar modelo
+                    # Erro não relacionado a quota
                     self.debug_info.append({
-                        "contexto": contexto_adicional,
-                        "prompt": prompt,
+                        "contexto": contexto_debug,
+                        "prompt": str(mensagens[-1].content)[:200] if mensagens else "",
                         "resposta": None,
+                        "tool_calls": [],
                         "modelo_usado": self.modelo_atual,
+                        "tempo_ms": 0,
                         "erro": str(e)
                     })
                     raise Exception(f"Erro ao chamar LLM: {str(e)}")
         
-        # Se chegou aqui, esgotou todas as tentativas
-        raise Exception(f"Erro ao chamar LLM: Não foi possível obter resposta após {max_tentativas} tentativas com diferentes modelos.")
+        raise Exception("Máximo de tentativas excedido.")
+    
+    def processar_com_tools(
+        self, 
+        prompt_sistema: str, 
+        mensagem_usuario: str,
+        contexto_debug: str = "",
+        usar_memoria: bool = True
+    ) -> tuple:
+        """
+        Processa mensagem usando o sistema de Tool Calling nativo.
+        
+        Args:
+            prompt_sistema: Prompt de sistema explicando contexto e responsabilidades
+            mensagem_usuario: Mensagem do usuário
+            contexto_debug: Contexto para debug
+            usar_memoria: Se deve incluir histórico da memória
+            
+        Returns:
+            tuple: (resposta_texto, tool_calls_executados)
+                - resposta_texto: Texto final da resposta
+                - tool_calls_executados: Lista de dicts com {name, args, result}
+        """
+        mensagens = [SystemMessage(content=prompt_sistema)]
+        
+        # Adiciona histórico da memória se solicitado
+        if usar_memoria:
+            historico = self.obter_historico_memoria()
+            # Limita histórico para não exceder contexto
+            mensagens.extend(historico[-10:])  # Últimas 10 mensagens
+        
+        mensagens.append(HumanMessage(content=mensagem_usuario))
+        
+        # Primeira chamada ao LLM
+        resposta = self.invocar_llm(mensagens, contexto_debug)
+        
+        tool_calls_executados = []
+        
+        # Se tem tool_calls, executa as ferramentas
+        while resposta.tool_calls:
+            # Adiciona resposta da IA com tool_calls
+            mensagens.append(resposta)
+            
+            for tool_call in resposta.tool_calls:
+                tool_name = tool_call["name"]
+                tool_args = tool_call["args"]
+                
+                # Executa a ferramenta
+                if tool_name in self.tools_by_name:
+                    try:
+                        tool_result = self.tools_by_name[tool_name].invoke(tool_args)
+                    except Exception as e:
+                        tool_result = f"Erro ao executar {tool_name}: {str(e)}"
+                else:
+                    tool_result = f"Ferramenta {tool_name} não encontrada"
+                
+                tool_calls_executados.append({
+                    "name": tool_name,
+                    "args": tool_args,
+                    "result": tool_result
+                })
+                
+                # Adiciona resultado da ferramenta às mensagens
+                mensagens.append(ToolMessage(
+                    content=str(tool_result),
+                    tool_call_id=tool_call["id"]
+                ))
+            
+            # Chama LLM novamente para gerar resposta final
+            resposta = self.invocar_llm(mensagens, f"{contexto_debug} - após tools")
+        
+        # Extrai texto da resposta de forma segura
+        texto_resposta = self._extrair_texto_resposta(resposta.content)
+        return (texto_resposta, tool_calls_executados)
+    
+    # ==================== MÉTODOS LEGADOS (para compatibilidade) ====================
+    
+    def adicionar_mensagem(self, mensagem: str, tipo: str = "human"):
+        """LEGADO: Adiciona mensagem ao histórico (mantido para compatibilidade)"""
+        if tipo == "human":
+            self.memory.add_user_message(mensagem)
+        else:
+            self.memory.add_ai_message(mensagem)
+    
+    def limpar_historico(self):
+        """LEGADO: Limpa o histórico (agora limpa a memória)"""
+        self.limpar_memoria()
+    
+    def gerar_resposta(self, prompt: str, contexto_adicional: str = "", usar_historico: bool = True) -> str:
+        """
+        LEGADO: Método antigo mantido para compatibilidade.
+        Recomendado usar processar_com_tools() para novos desenvolvimentos.
+        """
+        mensagens = []
+        
+        if usar_historico:
+            mensagens.extend(self.obter_historico_memoria()[-6:])
+        
+        mensagens.append(HumanMessage(content=prompt))
+        
+        resposta = self.invocar_llm(mensagens, contexto_adicional)
+        return self._extrair_texto_resposta(resposta.content)
     
     def processar_com_comandos(self, prompt: str, contexto_adicional: str = "", usar_historico: bool = False) -> tuple:
         """
-        Processa um prompt com suporte a comandos tipo MCP.
-        
-        Se a IA responder com texto normal, retorna o texto.
-        Se a IA responder com um comando (palavra única em maiúsculas), retorna o comando
-        para ser processado pelo agente específico.
-        
-        Args:
-            prompt: Prompt a ser enviado ao LLM
-            contexto_adicional: Informação adicional para debug
-            usar_historico: Se True, usa histórico de mensagens. Se False (padrão), envia apenas o prompt atual.
-                           Use False para prompts específicos (ex: extrair CPF, identificar moeda).
-                           Use True para conversas normais que precisam de contexto.
-        
-        Returns:
-            tuple: (resposta_texto: Optional[str], comando: Optional[str], dados_comando: Optional[Dict])
-                   - resposta_texto: Resposta em texto da IA (se não for comando)
-                   - comando: Nome do comando em maiúsculas (se for comando)
-                   - dados_comando: Dados adicionais do comando (se houver, formato COMANDO:dados)
+        LEGADO: Método antigo de comandos textuais.
+        Mantido para compatibilidade durante migração.
         """
         resposta_llm = self.gerar_resposta(prompt, contexto_adicional=contexto_adicional, usar_historico=usar_historico)
         resposta_stripped = resposta_llm.strip()
-        
-        # Remove espaços extras e normaliza
         resposta_normalizada = " ".join(resposta_stripped.split())
         
-        # Verifica se é um comando com dados (formato: COMANDO:dados ou COMANDO: dados)
-        # Verifica ANTES do comando simples para pegar comandos com dados
+        # Verifica comando com dados (COMANDO:dados)
         if ":" in resposta_normalizada:
             partes = resposta_normalizada.split(":", 1)
             comando = partes[0].strip().upper()
             dados = partes[1].strip() if len(partes) > 1 else ""
-            # Verifica se o comando é apenas letras e números (permite números após letras, ex: SOLICITAR_AUMENTO)
             if comando.replace("_", "").isalnum() and len(comando.split()) == 1:
                 return (None, comando, {"dados": dados})
         
-        # Verifica se é um comando simples (palavra única em maiúsculas, apenas letras e underscore)
-        # Remove underscores para verificar se é alfanumérico
+        # Verifica comando simples
         comando_candidato = resposta_normalizada.upper()
         if comando_candidato.replace("_", "").isalnum() and len(comando_candidato.split()) == 1:
             return (None, comando_candidato, None)
         
-        # Se não é comando, retorna a resposta normalmente
         return (resposta_llm, None, None)
-

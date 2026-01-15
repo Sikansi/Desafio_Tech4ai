@@ -105,7 +105,9 @@ class Orchestrator:
                 "encerrar": resultado.get("encerrar", False),
                 "agente_atual": self._obter_nome_agente_atual(),
                 "debug_info": debug_info,
-                "erro": None
+                "erro": None,
+                "score_calculado": resultado.get("score_calculado"),
+                "limite_maximo": resultado.get("limite_maximo")
             }
         
         except Exception as e:
@@ -165,6 +167,12 @@ class Orchestrator:
     
     def resetar(self):
         """Reseta o orquestrador para nova conversa"""
+        # Limpa memória compartilhada
+        from agents.base_agent import BaseAgent
+        if BaseAgent._memoria_compartilhada:
+            BaseAgent._memoria_compartilhada.clear()
+        
+        # Reseta agentes
         self.agente_triagem.resetar()
         self.agente_entrevista.resetar()
         self.agente_atual = self.agente_triagem
@@ -175,4 +183,6 @@ class Orchestrator:
             "historico": []
         }
         self.agente_credito.cliente = None
+        self.agente_credito.entrevista_oferecida = False
+        self.agente_cambio.debug_info = []
 

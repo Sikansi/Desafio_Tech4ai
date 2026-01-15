@@ -44,7 +44,7 @@ Desafio_Tech4ai/
 ├── app.py              # Interface Streamlit
 ├── requirements.txt    # Dependências do projeto
 ├── listar_modelos.py   # Script para listar modelos disponíveis da API
-├── config_example.txt  # Exemplo de configuração da API key
+├── doc.md              # Enunciado original do desafio técnico
 └── .env                # Arquivo de configuração (criar manualmente, não está no repo)
 ```
 
@@ -248,40 +248,104 @@ score = (
 
 ## 🔧 Escolhas Técnicas e Justificativas
 
-### Framework: LangChain + Google Gemini
-**Justificativa**:
-- LangChain oferece abstrações poderosas para agentes
-- Google Gemini API tem free tier generoso
-- Boa documentação e comunidade ativa
-- Suporte nativo a múltiplos modelos
+### Stack Tecnológica
 
-### Armazenamento: Arquivos CSV
-**Justificativa**:
-- Simplicidade para protótipo
-- Fácil visualização e edição manual
-- Sem necessidade de banco de dados complexo
-- Adequado para volumes pequenos/médios
+| Componente | Tecnologia | Alternativas Consideradas |
+|------------|------------|---------------------------|
+| **LLM** | Google Gemini | OpenAI GPT-4, Claude, Groq |
+| **Framework** | LangChain | LangGraph, CrewAI, Google ADK |
+| **UI** | Streamlit | Gradio, Flask, FastAPI |
+| **API Cotação** | AwesomeAPI | ExchangeRate-API, Fixer.io |
+| **Dados** | CSV + Pandas | SQLite, PostgreSQL |
+
+### LLM: Google Gemini
+
+**Por que Gemini?**
+- **Free tier generoso**: ~1500 requisições/dia sem custo
+- **Modelos de qualidade**: gemini-2.5-flash oferece boa performance para tarefas conversacionais
+- **Tool Calling nativo**: Suporte integrado para Function Calling, essencial para a arquitetura de agentes
+- **Baixa latência**: Respostas rápidas comparado a alternativas
+
+**Por que não outras opções?**
+- **OpenAI GPT-4**: Pago, custo por token significativo
+- **Claude**: Limite de uso gratuito mais restritivo
+- **Groq**: Muito rápido, mas modelos menos inteligentes para interpretação contextual
+
+### Framework: LangChain
+
+**Por que LangChain?**
+- **Consolidado**: Framework maduro com grande comunidade
+- **Tool Calling integrado**: Abstração elegante para Function Calling via decorators `@tool`
+- **Gerenciamento de memória**: `InMemoryChatMessageHistory` pronto para uso
+- **Integração Gemini**: `langchain-google-genai` bem documentado e mantido
+- **Flexibilidade**: Fácil trocar entre provedores de LLM se necessário
+
+**Por que não outras opções?**
+- **LangGraph**: Mais complexo, ideal para fluxos com loops/condicionais mais elaborados
+- **CrewAI**: Focado em agentes autônomos colaborativos, overkill para este caso
+- **Google ADK**: Muito novo, menos documentação e exemplos
 
 ### Interface: Streamlit
-**Justificativa**:
-- Desenvolvimento rápido de UI
-- Integração nativa com Python
-- Suporte a chat interface
-- Fácil deploy e compartilhamento
 
-### Arquitetura: Agentes Especializados + Orquestrador
-**Justificativa**:
-- Separação clara de responsabilidades
-- Fácil manutenção e extensão
-- Cada agente pode ser testado isoladamente
-- Permite adicionar novos agentes facilmente
+**Por que Streamlit?**
+- **Zero frontend code**: Interface completa apenas com Python
+- **Setup em minutos**: `pip install streamlit` + `streamlit run app.py`
+- **Chat nativo**: Componentes `st.chat_input` e `st.chat_message` prontos
+- **Hot reload**: Atualiza automaticamente ao salvar código
+- **Deploy fácil**: Streamlit Cloud gratuito para demonstrações
+
+**Por que não outras opções?**
+- **Gradio**: Muito similar, escolha poderia ser qualquer um
+- **Flask/FastAPI**: Exigem frontend separado (React, Vue, etc.)
 
 ### API de Cotações: AwesomeAPI
-**Justificativa**:
-- API pública gratuita
-- Sem necessidade de autenticação
-- Dados atualizados em tempo real
-- Boa documentação
+
+**Por que AwesomeAPI?**
+- **100% gratuita**: Sem limites de uso, sem necessidade de cadastro
+- **Sem API key**: Zero configuração adicional
+- **Dados confiáveis**: Fonte baseada em dados do Banco Central do Brasil
+- **Múltiplas moedas**: USD, EUR, GBP, JPY, CHF, CAD, AUD, CNY, ARS, CLP, MXN
+- **Tempo real**: Cotações atualizadas constantemente
+
+**Por que não outras opções?**
+- **ExchangeRate-API**: Requer API key, limite no plano gratuito
+- **Fixer.io**: Plano gratuito muito limitado (100 req/mês)
+
+### Armazenamento: Arquivos CSV
+
+**Por que CSV?**
+- **Requisito do desafio**: Especificado no enunciado
+- **Simplicidade**: Fácil de ler, editar e versionar
+- **Transparência**: Dados visíveis para debug e testes
+- **Zero config**: Não precisa instalar banco de dados
+
+**Limitações conhecidas**:
+- Não escala para muitos usuários simultâneos
+- Sem transações ACID
+- Em produção, migraria para SQLite ou PostgreSQL
+
+### Arquitetura: Agentes Especializados + Orquestrador
+
+**Por que esta arquitetura?**
+- **Separação de responsabilidades**: Cada agente com escopo bem definido
+- **Requisito do desafio**: 3 agentes especializados + triagem
+- **Manutenibilidade**: Fácil modificar um agente sem afetar outros
+- **Testabilidade**: Cada agente pode ser testado isoladamente
+- **Extensibilidade**: Adicionar novos agentes é trivial
+
+### Dependências do Projeto
+
+```
+streamlit>=1.28.0           # Interface web
+langchain>=0.1.0            # Framework principal de agentes
+langchain-google-genai>=1.0.0  # Integração com Gemini
+langchain-core>=0.1.0       # Mensagens, Tools, Memória
+python-dotenv>=1.0.0        # Carregar variáveis de ambiente
+pandas>=2.0.0               # Manipulação de CSVs
+requests>=2.31.0            # Chamadas HTTP (API cotação)
+pydantic>=2.0.0             # Validação de schemas (tools)
+google-generativeai>=0.3.0  # SDK Gemini
+```
 
 ## 📚 Tutorial de Execução e Testes
 
@@ -319,7 +383,6 @@ pip install -r requirements.txt
 
 4. **Configure a chave da API**:
    - **Opção 1 (Recomendada)**: Crie um arquivo `.env` na raiz do projeto (mesmo diretório onde está o `app.py`)
-     - Você pode usar o arquivo `config_example.txt` como referência
      - Crie um arquivo chamado `.env` (sem extensão)
      - Adicione a seguinte linha: `GOOGLE_API_KEY=sua_chave_aqui`
      - Substitua `sua_chave_aqui` pela sua chave real
@@ -434,7 +497,6 @@ Isso permite transparência total sobre como a IA está interpretando as mensage
 - Verifique se o arquivo `.env` existe na raiz do projeto
 - Confirme que o arquivo contém exatamente: `GOOGLE_API_KEY=sua_chave_aqui` (sem espaços)
 - Certifique-se de que o arquivo está no mesmo diretório que `app.py`
-- Você pode usar o arquivo `config_example.txt` como referência
 
 #### Erro: "RESOURCE_EXHAUSTED" ou "Quota Exceeded"
 - O sistema automaticamente tenta outros modelos quando um atinge o limite
