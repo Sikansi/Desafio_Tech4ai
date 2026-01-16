@@ -60,6 +60,14 @@ INSTRUÇÕES:
 4. Se o CPF for válido (11 dígitos), informe e peça a data de nascimento
 5. Se inválido, peça novamente de forma educada
 
+IMPORTANTE: Se o cliente informar CPF E data de nascimento juntos na mesma mensagem:
+1. Use validar_cpf para extrair o CPF
+2. Use validar_data_nascimento para extrair a data
+3. Use autenticar_cliente_tool com ambos os dados para autenticar diretamente
+4. Se autenticado, cumprimente pelo nome e pergunte como pode ajudar
+
+NUNCA responda apenas com números ou dados concatenados. Sempre responda com frases completas e amigáveis.
+
 Seja natural e acolhedor. Responda em português do Brasil."""
 
         elif etapa == "coletando_nascimento":
@@ -72,12 +80,13 @@ Seja natural e acolhedor. Responda em português do Brasil."""
 CPF JÁ INFORMADO: {cpf_formatado}
 
 INSTRUÇÕES:
-1. Peça a data de nascimento
-2. Use validar_data_nascimento para extrair e normalizar a data
-3. Aceite formatos: DD/MM/AAAA ou AAAA-MM-DD
-4. Se válida, use autenticar_cliente_tool para autenticar
-5. Se autenticação bem sucedida, cumprimente pelo nome e pergunte como pode ajudar
-6. Se falhar, informe e peça para tentar novamente
+1. Quando o cliente informar a data de nascimento, use validar_data_nascimento para extrair e normalizar a data
+2. Aceite formatos: DD/MM/AAAA ou AAAA-MM-DD
+3. Se válida, use autenticar_cliente_tool(cpf="{self.estado.get('cpf', '')}", data_nascimento=DATA_EXTRAIDA) para autenticar
+4. Se autenticação bem sucedida, cumprimente pelo nome e pergunte como pode ajudar
+5. Se falhar, informe e peça para tentar novamente
+
+IMPORTANTE: Você DEVE chamar autenticar_cliente_tool após validar a data. Não apenas responda que vai validar - execute a autenticação!
 
 Tentativas restantes: {3 - self.estado['tentativas_falha']}
 
@@ -97,6 +106,11 @@ INSTRUÇÕES:
    - Se mencionar cotação, dólar, euro, moeda → use redirecionar_para_cambio()
    - Se mencionar entrevista, score → use redirecionar_para_entrevista()
 3. Se não entender claramente, pergunte como pode ajudar
+
+PROIBIDO:
+- NUNCA mencione "transferir", "outro agente", "redirecionar", "outra área"
+- A transição deve ser INVISÍVEL para o cliente
+- Apenas continue a conversa naturalmente após usar a tool
 
 Seja natural e prestativo. Responda em português do Brasil."""
 
@@ -187,15 +201,19 @@ Seja natural e prestativo. Responda em português do Brasil."""
                 resposta_final = resposta_texto
             else:
                 # Log para debug - resposta vazia do LLM
-                print(f"[TriagemAgent] Resposta vazia do LLM, gerando nova chamada...")
-                # Faz nova chamada forçando resposta
-                resposta_texto, _ = self.processar_com_tools(
-                    prompt_sistema=self._get_system_prompt() + "\n\nIMPORTANTE: Você DEVE gerar uma resposta. Cumprimente o cliente e peça o CPF.",
-                    mensagem_usuario=mensagem,
-                    contexto_debug=f"TriagemAgent.processar - retry etapa: {self.estado['etapa']}",
-                    usar_memoria=False
-                )
-                resposta_final = resposta_texto or "Olá! Bem-vindo ao Banco Ágil. Como posso ajudá-lo? Para começar, informe seu CPF."
+                print(f"[TriagemAgent] Resposta vazia do LLM na etapa '{self.estado['etapa']}', gerando resposta apropriada...")
+                
+                # Gera resposta baseada no estado atual (sem chamar LLM novamente)
+                if self.estado["etapa"] == "autenticado":
+                    cliente = self.estado.get("cliente", {})
+                    nome = cliente.get("nome", "")
+                    resposta_final = f"Autenticação realizada com sucesso! Olá, {nome}! Como posso ajudá-lo hoje? Posso ajudar com consultas de crédito, cotações de moedas ou entrevista de crédito."
+                elif self.estado["etapa"] == "coletando_nascimento":
+                    resposta_final = "Agora, por favor, me informe sua data de nascimento para completar a autenticação."
+                elif self.estado["etapa"] == "coletando_cpf":
+                    resposta_final = "Por favor, me informe seu CPF para que eu possa autenticá-lo."
+                else:
+                    resposta_final = "Olá! Bem-vindo ao Banco Ágil. Como posso ajudá-lo? Para começar, informe seu CPF."
             
             # Avança etapa se necessário (primeira interação)
             if self.estado["etapa"] == "saudacao":
@@ -255,8 +273,8 @@ Seja natural e prestativo. Responda em português do Brasil."""
         
         return False
     
-    def resetar(self):
-        """Reseta o estado do agente"""
+    def resetar(self, limpar_memoria_compartilhada: bool = False):
+        """Reseta o estado do agente (preserva memória por padrão)"""
         self.estado = {
             "etapa": "saudacao",
             "tentativas_falha": 0,
@@ -264,4 +282,7 @@ Seja natural e prestativo. Responda em português do Brasil."""
             "data_nascimento": None,
             "cliente": None
         }
-        self.limpar_memoria()
+        # Só limpa memória se explicitamente solicitado
+        # (orquestrador já limpa a memória compartilhada diretamente)
+        if limpar_memoria_compartilhada:
+            self.limpar_memoria()

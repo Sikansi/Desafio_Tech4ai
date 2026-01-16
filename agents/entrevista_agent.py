@@ -11,12 +11,7 @@ from utils.csv_handler import obter_cliente_por_cpf
 class EntrevistaAgent(BaseAgent):
     """Agente responsável por conduzir entrevista financeira e recalcular score"""
     
-    SYSTEM_PROMPT = """Você é o Agente de Entrevista de Crédito de um banco digital.
-
-CONTEXTO DO SISTEMA BANCÁRIO:
-- Agente de Crédito: Limite e aumento de crédito
-- Agente de Câmbio: Cotações de moedas
-- Você (Agente de Entrevista): Conduz entrevista para atualizar score de crédito
+    SYSTEM_PROMPT = """Você está conduzindo uma entrevista de crédito para um banco digital.
 
 DADOS DO CLIENTE:
 {dados_cliente}
@@ -24,35 +19,46 @@ DADOS DO CLIENTE:
 DADOS JÁ COLETADOS NA ENTREVISTA:
 {dados_coletados}
 
-SUAS FERRAMENTAS (USE-AS!):
-1. registrar_renda_mensal(valor) - Registra renda. Aceite: 5000, "5 mil", "250k", "1 milhão"
-2. registrar_tipo_emprego(tipo) - Registra emprego: "formal", "autônomo", "desempregado"
-3. registrar_despesas_fixas(valor) - Registra despesas. Aceite 0 se não tiver
-4. registrar_dependentes(quantidade) - Registra dependentes: 0, 1, 2, 3 ou mais
-5. registrar_dividas(possui_dividas) - Registra dívidas: True ou False
-6. calcular_novo_score(cpf, renda_mensal, tipo_emprego, despesas_fixas, num_dependentes, tem_dividas) - Calcula e atualiza o score
-7. redirecionar_para_credito() - Se cliente quer ver limite ou solicitar aumento
-8. redirecionar_para_cambio() - Se cliente quer cotação de moedas
+SUAS FERRAMENTAS:
+1. registrar_renda_mensal(valor) - Registra renda mensal (número)
+2. registrar_tipo_emprego(tipo) - "formal", "autônomo" ou "desempregado"
+3. registrar_despesas_fixas(valor) - Registra despesas (número, pode ser 0)
+4. registrar_dependentes(quantidade) - Número de dependentes (0, 1, 2, 3...)
+5. registrar_dividas(possui_dividas) - True ou False
+6. calcular_novo_score(...) - Calcula o novo score
+7. redirecionar_para_credito() - Quando cliente quer ver/solicitar limite
+8. redirecionar_para_cambio() - Quando cliente quer cotação de moedas
 
-FLUXO DA ENTREVISTA:
-1. Pergunte a RENDA MENSAL → quando responder, use registrar_renda_mensal(valor)
-2. Pergunte o TIPO DE EMPREGO → quando responder, use registrar_tipo_emprego(tipo)
-3. Pergunte as DESPESAS FIXAS → quando responder, use registrar_despesas_fixas(valor)
-4. Pergunte os DEPENDENTES → quando responder, use registrar_dependentes(quantidade)
-5. Pergunte sobre DÍVIDAS → quando responder, use registrar_dividas(possui_dividas)
-6. Após coletar TODOS os 5 dados, use calcular_novo_score com todos os parâmetros
+REGRAS OBRIGATÓRIAS:
+1. Quando o cliente responder, SEMPRE: chame a tool + faça a PRÓXIMA pergunta na mesma resposta
+2. NUNCA deixe a resposta vazia após uma tool call
+3. Verifique DADOS JÁ COLETADOS - se não é None, NÃO pergunte novamente
+4. Após CADA tool call bem-sucedida, confirme brevemente e faça a próxima pergunta
 
-INSTRUÇÕES IMPORTANTES:
-- SEMPRE use uma ferramenta quando o cliente fornecer uma informação
-- Extraia valores numéricos: "5 mil" = 5000, "250k" = 250000
-- Se o cliente disser "CLT" ou "carteira assinada" → tipo = "formal"
-- Se o cliente disser "PJ", "MEI", "freelancer" → tipo = "autônomo"
-- Se o cliente disser "zero", "nenhum", "não tenho" para despesas → valor = 0
-- Após calcular_novo_score, informe o resultado e pergunte se quer solicitar aumento de limite
-- Se o cliente quiser aumentar limite após entrevista → use redirecionar_para_credito()
-- Se o cliente perguntar sobre moedas/cotação → use redirecionar_para_cambio()
+MAPEAMENTO:
+- "CLT", "carteira assinada" → tipo = "formal"
+- "PJ", "MEI", "freelancer" → tipo = "autônomo"
+- "desempregado" → tipo = "desempregado"
+- "zero", "nenhum", "não tenho" (despesas) → valor = 0
+- "não", "nenhum" (dependentes) → quantidade = 0
+- "não" (dívidas) → possui_dividas = False
+- "sim" (dívidas) → possui_dividas = True
 
-Seja natural, amigável e conduza a entrevista de forma fluida. Responda em português do Brasil."""
+FLUXO:
+1. RENDA → registrar_renda_mensal → "Ok! E qual seu tipo de emprego?"
+2. EMPREGO → registrar_tipo_emprego → "Entendi! Quais suas despesas fixas mensais?"
+3. DESPESAS → registrar_despesas_fixas → "Certo! Quantos dependentes você possui?"
+4. DEPENDENTES → registrar_dependentes → "Ok! Você possui alguma dívida ativa?"
+5. DÍVIDAS → registrar_dividas → calcular_novo_score
+6. Após calcular → "Seu novo score é X! Gostaria de solicitar um aumento de limite agora?"
+7. Se cliente aceitar → use redirecionar_para_credito (SEM dizer que está transferindo)
+
+PROIBIDO:
+- NUNCA mencione "transferir", "outro agente", "área de crédito", "redirecionar"
+- NUNCA deixe resposta vazia - SEMPRE confirme e faça próxima pergunta
+- A transição deve ser INVISÍVEL para o cliente
+
+Seja natural e objetivo. Responda em português do Brasil."""
 
     def __init__(self, api_key: Optional[str] = None):
         super().__init__(api_key)
@@ -158,6 +164,7 @@ Seja natural, amigável e conduza a entrevista de forma fluida. Responda em port
             
             # Processa resultados das tools
             proximo_agente = None
+            ultima_proxima_pergunta = None
             
             for tc in tool_calls:
                 result = tc["result"]
@@ -168,21 +175,31 @@ Seja natural, amigável e conduza a entrevista de forma fluida. Responda em port
                 elif tc["name"] == "redirecionar_para_cambio":
                     proximo_agente = "cambio"
                 
-                # Registros - atualiza estado local
+                # Registros - atualiza estado local e captura próxima pergunta
                 elif tc["name"] == "registrar_renda_mensal" and isinstance(result, dict) and result.get("sucesso"):
                     self.dados_entrevista["renda_mensal"] = result.get("valor")
+                    ultima_proxima_pergunta = result.get("proxima_pergunta")
+                    print(f"[EntrevistaAgent] ✅ Renda registrada: {result.get('valor')}")
                 
                 elif tc["name"] == "registrar_tipo_emprego" and isinstance(result, dict) and result.get("sucesso"):
                     self.dados_entrevista["tipo_emprego"] = result.get("valor")
+                    ultima_proxima_pergunta = result.get("proxima_pergunta")
+                    print(f"[EntrevistaAgent] ✅ Tipo emprego registrado: {result.get('valor')}")
                 
                 elif tc["name"] == "registrar_despesas_fixas" and isinstance(result, dict) and result.get("sucesso"):
                     self.dados_entrevista["despesas_fixas"] = result.get("valor")
+                    ultima_proxima_pergunta = result.get("proxima_pergunta")
+                    print(f"[EntrevistaAgent] ✅ Despesas registradas: {result.get('valor')}")
                 
                 elif tc["name"] == "registrar_dependentes" and isinstance(result, dict) and result.get("sucesso"):
                     self.dados_entrevista["num_dependentes"] = result.get("valor")
+                    ultima_proxima_pergunta = result.get("proxima_pergunta")
+                    print(f"[EntrevistaAgent] ✅ Dependentes registrado: {result.get('valor')}")
                 
                 elif tc["name"] == "registrar_dividas" and isinstance(result, dict) and result.get("sucesso"):
                     self.dados_entrevista["tem_dividas"] = result.get("valor")
+                    ultima_proxima_pergunta = result.get("proxima_pergunta")
+                    print(f"[EntrevistaAgent] ✅ Dívidas registrado: {result.get('valor')}")
                 
                 elif tc["name"] == "calcular_novo_score" and isinstance(result, dict) and result.get("sucesso"):
                     self.dados_entrevista["score_calculado"] = result.get("novo_score")
@@ -191,19 +208,27 @@ Seja natural, amigável e conduza a entrevista de forma fluida. Responda em port
                     # Atualiza cliente local
                     if self.cliente:
                         self.cliente["score"] = result.get("novo_score")
+                    print(f"[EntrevistaAgent] ✅ Score calculado: {result.get('novo_score')}")
             
-            # Se houve redirecionamento
+            # Se houve redirecionamento, não deixa resposta vazia
             if proximo_agente:
+                # Não precisa de resposta - a transição deve ser invisível
                 return {
-                    "resposta": "",
+                    "resposta": resposta_texto if resposta_texto else "",
                     "proximo_agente": proximo_agente,
                     "encerrar": False,
                     "score_calculado": self.dados_entrevista.get("score_calculado"),
                     "limite_maximo": self.dados_entrevista.get("limite_maximo")
                 }
             
-            # Resposta final
-            resposta_final = resposta_texto if resposta_texto else "Vamos continuar com a entrevista?"
+            # Resposta final - usa resposta da LLM, ou fallback inteligente
+            if resposta_texto:
+                resposta_final = resposta_texto
+            elif ultima_proxima_pergunta:
+                # Se a LLM não gerou texto mas houve tool call, usa a próxima pergunta
+                resposta_final = f"Registrado! {ultima_proxima_pergunta}"
+            else:
+                resposta_final = "Entendi! Como posso ajudar?"
             
             self.adicionar_a_memoria(mensagem, resposta_final)
             
@@ -252,8 +277,8 @@ Seja natural, amigável e conduza a entrevista de forma fluida. Responda em port
         msg = mensagem.lower()
         return any(p in msg for p in ["cancelar entrevista", "desistir da entrevista", "parar entrevista"])
     
-    def resetar(self):
-        """Reseta o estado"""
+    def resetar(self, limpar_memoria_compartilhada: bool = False):
+        """Reseta o estado do agente (mas preserva memória por padrão)"""
         self.dados_entrevista = {
             "renda_mensal": None,
             "tipo_emprego": None,
@@ -263,9 +288,12 @@ Seja natural, amigável e conduza a entrevista de forma fluida. Responda em port
             "score_calculado": None,
             "limite_maximo": None
         }
-        self.limpar_memoria()
+        # Só limpa memória se explicitamente solicitado
+        if limpar_memoria_compartilhada:
+            self.limpar_memoria()
     
     def definir_cliente(self, cliente: Dict[str, Any]):
-        """Define o cliente"""
+        """Define o cliente (preserva memória para manter contexto)"""
         self.cliente = cliente
-        self.resetar()
+        # Reseta dados da entrevista mas NÃO limpa a memória compartilhada
+        self.resetar(limpar_memoria_compartilhada=False)

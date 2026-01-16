@@ -41,8 +41,11 @@ def calcular_score(
         False: 100
     }
     
-    # Calcula componente de renda
-    componente_renda = (renda_mensal / (despesas_fixas + 1)) * peso_renda
+    # Calcula componente de renda (limitado a 400 pontos máximo)
+    # Razão renda/despesas ideal: quanto maior, melhor (até um limite)
+    razao = renda_mensal / (despesas_fixas + 1)
+    # Limita a razão para evitar scores absurdos
+    componente_renda = min(razao * peso_renda, 400)
     
     # Componente de emprego
     componente_emprego = peso_emprego.get(tipo_emprego.lower(), 0)

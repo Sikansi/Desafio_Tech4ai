@@ -81,6 +81,23 @@ def atualizar_score_cliente(cpf: str, novo_score: float, caminho: str = "data/cl
         raise Exception(f"Erro ao atualizar score: {str(e)}")
 
 
+def atualizar_limite_cliente(cpf: str, novo_limite: float, caminho: str = "data/clientes.csv"):
+    """Atualiza o limite de crédito de um cliente"""
+    try:
+        df = ler_clientes(caminho)
+        cpf_limpo = ''.join(filter(str.isdigit, cpf))
+        
+        # Garante que o limite é positivo
+        novo_limite = max(0, novo_limite)
+        
+        df.loc[df['cpf'].astype(str) == cpf_limpo, 'limite_credito'] = novo_limite
+        df.to_csv(caminho, index=False)
+        
+        return True
+    except Exception as e:
+        raise Exception(f"Erro ao atualizar limite: {str(e)}")
+
+
 def ler_score_limite(caminho: str = "data/score_limite.csv") -> pd.DataFrame:
     """Lê a tabela de limites por score"""
     try:

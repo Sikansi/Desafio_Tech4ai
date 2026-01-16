@@ -57,7 +57,7 @@ with st.sidebar:
             # Mostra score e limite máximo se disponível (após entrevista)
             if "ultimo_resultado" in st.session_state:
                 resultado = st.session_state.ultimo_resultado
-                if resultado.get("score_calculado"):
+                if resultado and isinstance(resultado, dict) and resultado.get("score_calculado"):
                     st.markdown("---")
                     st.markdown("### 📊 Resultado da Entrevista")
                     st.success(f"**Score:** {resultado['score_calculado']} pontos")
@@ -74,6 +74,8 @@ with st.sidebar:
         st.session_state.debug_info = []
     if "debug_idx" not in st.session_state:
         st.session_state.debug_idx = 0
+    if "ultimo_resultado" not in st.session_state:
+        st.session_state.ultimo_resultado = {}
     
     if st.session_state.debug_info:
         total = len(st.session_state.debug_info)
@@ -116,10 +118,23 @@ with st.sidebar:
         # Tool calls
         tool_calls = debug.get("tool_calls", [])
         if tool_calls:
-            st.success(f"🔧 Tools: {', '.join(tool_calls)}")
+            # Suporta tanto formato antigo (lista de strings) quanto novo (lista de dicts)
+            if isinstance(tool_calls[0], dict):
+                tool_names = [tc.get("name", "unknown") for tc in tool_calls]
+                st.success(f"🔧 Tools: {', '.join(tool_names)}")
+                # Mostra detalhes das tool calls
+                with st.expander("🔧 Ver detalhes das Tool Calls", expanded=False):
+                    for tc in tool_calls:
+                        st.code(f"{tc.get('name', 'unknown')}({tc.get('args', {})})", language="python")
+            else:
+                st.success(f"🔧 Tools: {', '.join(tool_calls)}")
         
-        # Prompt e resposta em expanders
-        with st.expander("📤 Ver Prompt", expanded=False):
+        # System prompt, prompt do usuário e resposta em expanders
+        if debug.get("system_prompt"):
+            with st.expander("🧠 Ver System Prompt", expanded=False):
+                st.code(debug.get("system_prompt", "N/A"), language="text")
+        
+        with st.expander("📤 Ver Mensagem do Usuário", expanded=False):
             st.code(debug.get("prompt", "N/A"), language="text")
         
         if debug.get("erro"):

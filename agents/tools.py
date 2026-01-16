@@ -7,7 +7,8 @@ from utils.csv_handler import (
     obter_cliente_por_cpf,
     verificar_limite_permitido,
     registrar_solicitacao_aumento,
-    atualizar_score_cliente
+    atualizar_score_cliente,
+    atualizar_limite_cliente
 )
 from utils.cotacao_api import buscar_cotacao_moeda
 from utils.score_calculator import calcular_score
@@ -98,12 +99,17 @@ def solicitar_aumento_limite(cpf: str, novo_limite: float) -> dict:
     
     if permitido:
         status = "aprovado"
-        mensagem = f"Solicitação APROVADA! Novo limite: R$ {novo_limite:,.2f}"
+        # ATUALIZA O LIMITE NO CSV quando aprovado!
+        try:
+            atualizar_limite_cliente(cpf, novo_limite)
+            mensagem = f"Solicitação APROVADA! Seu novo limite de R$ {novo_limite:,.2f} já está ativo."
+        except Exception as e:
+            mensagem = f"Solicitação aprovada, mas houve um erro ao atualizar: {str(e)}"
     else:
         status = "rejeitado_sugerir_entrevista"
         mensagem = f"Limite de R$ {novo_limite:,.2f} não aprovado com o perfil atual. Sugerimos uma entrevista de crédito para melhorar a avaliação."
     
-    # Registra solicitação
+    # Registra solicitação no histórico
     try:
         registrar_solicitacao_aumento(cpf, limite_atual, novo_limite, status.replace("_sugerir_entrevista", ""))
     except Exception as e:
@@ -112,7 +118,8 @@ def solicitar_aumento_limite(cpf: str, novo_limite: float) -> dict:
     return {
         "sucesso": True,
         "status": status,
-        "limite_atual": limite_atual,
+        "limite_anterior": limite_atual,
+        "limite_novo": novo_limite if permitido else limite_atual,
         "limite_solicitado": novo_limite,
         "mensagem": mensagem,
         "sugerir_entrevista": status == "rejeitado_sugerir_entrevista"
@@ -397,9 +404,10 @@ def validar_cpf(cpf: str) -> dict:
 def validar_data_nascimento(data: str) -> dict:
     """
     Valida e normaliza data de nascimento.
+    Aceita vários formatos: DD/MM/AAAA, AAAA-MM-DD, "15 de maio de 1990", etc.
     
     Args:
-        data: Data informada (DD/MM/AAAA ou AAAA-MM-DD)
+        data: Data informada em qualquer formato
     
     Returns:
         Data normalizada (AAAA-MM-DD) ou erro
@@ -407,27 +415,67 @@ def validar_data_nascimento(data: str) -> dict:
     import re
     from datetime import datetime
     
+    # Mapeamento de meses em português para números
+    meses_pt = {
+        'janeiro': '01', 'jan': '01',
+        'fevereiro': '02', 'fev': '02',
+        'março': '03', 'mar': '03', 'marco': '03',
+        'abril': '04', 'abr': '04',
+        'maio': '05', 'mai': '05',
+        'junho': '06', 'jun': '06',
+        'julho': '07', 'jul': '07',
+        'agosto': '08', 'ago': '08',
+        'setembro': '09', 'set': '09',
+        'outubro': '10', 'out': '10',
+        'novembro': '11', 'nov': '11',
+        'dezembro': '12', 'dez': '12'
+    }
+    
+    data_lower = data.lower().strip()
+    
     # Tenta formato DD/MM/AAAA
-    match = re.search(r'(\d{2})/(\d{2})/(\d{4})', data)
+    match = re.search(r'(\d{1,2})/(\d{1,2})/(\d{4})', data)
     if match:
         dia, mes, ano = match.groups()
         try:
             datetime(int(ano), int(mes), int(dia))
-            return {"sucesso": True, "data": f"{ano}-{mes}-{dia}"}
+            return {"sucesso": True, "data": f"{ano}-{mes.zfill(2)}-{dia.zfill(2)}"}
         except:
             pass
     
     # Tenta formato AAAA-MM-DD
-    match = re.search(r'(\d{4})-(\d{2})-(\d{2})', data)
+    match = re.search(r'(\d{4})-(\d{1,2})-(\d{1,2})', data)
     if match:
         ano, mes, dia = match.groups()
         try:
             datetime(int(ano), int(mes), int(dia))
-            return {"sucesso": True, "data": f"{ano}-{mes}-{dia}"}
+            return {"sucesso": True, "data": f"{ano}-{mes.zfill(2)}-{dia.zfill(2)}"}
         except:
             pass
     
-    return {"sucesso": False, "erro": "Data inválida. Use o formato DD/MM/AAAA ou AAAA-MM-DD."}
+    # Tenta formato "15 de maio de 1990" ou "15 maio 1990"
+    match = re.search(r'(\d{1,2})\s*(?:de\s+)?(\w+)\s*(?:de\s+)?(\d{4})', data_lower)
+    if match:
+        dia, mes_texto, ano = match.groups()
+        if mes_texto in meses_pt:
+            mes = meses_pt[mes_texto]
+            try:
+                datetime(int(ano), int(mes), int(dia))
+                return {"sucesso": True, "data": f"{ano}-{mes}-{dia.zfill(2)}"}
+            except:
+                pass
+    
+    # Tenta formato DD-MM-AAAA
+    match = re.search(r'(\d{1,2})-(\d{1,2})-(\d{4})', data)
+    if match:
+        dia, mes, ano = match.groups()
+        try:
+            datetime(int(ano), int(mes), int(dia))
+            return {"sucesso": True, "data": f"{ano}-{mes.zfill(2)}-{dia.zfill(2)}"}
+        except:
+            pass
+    
+    return {"sucesso": False, "erro": "Data inválida. Tente formatos como: 15/05/1990, 15 de maio de 1990, ou 1990-05-15."}
 
 
 @tool

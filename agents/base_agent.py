@@ -13,42 +13,98 @@ import time
 class BaseAgent(ABC):
     """Classe base abstrata para todos os agentes do sistema"""
     
-    # Cache compartilhado de modelos esgotados (compartilhado entre todas as instâncias)
-    _modelos_esgotados_compartilhado = set()
+    # Cache compartilhado de modelos esgotados POR API KEY
+    # Formato: {"api_key_1": {"modelo1", "modelo2"}, "api_key_2": set()}
+    _modelos_esgotados_por_key = {}
+    
+    # API key atual sendo usada (compartilhada entre instâncias)
+    _api_key_atual_idx = 0
+    _api_keys_disponiveis = []
     
     # Memória compartilhada entre agentes (para manter contexto na troca)
     _memoria_compartilhada = None
     
-    # Lista ordenada de modelos - vai direto para lite quando quota esgota
-    # Modelos da mesma família compartilham quota, então pulamos para lite direto
+    # Lista ordenada de modelos com suporte a Function Calling
+    # Nota: Modelos 2.0 compartilham quota com 2.5, então só usamos 2.5
+    # Nota: Gemma NÃO suporta Function Calling
     MODELOS_FALLBACK = [
-        "gemini-2.5-flash",           # Principal
-        "gemini-2.5-flash-lite",      # Fallback direto (lite tem quota separada)
-        "gemini-2.0-flash",           # Alternativa
-        "gemini-2.0-flash-lite",      # Alternativa lite
+        "gemini-2.5-flash",           # Principal - melhor qualidade
+        "gemini-2.5-flash-lite",      # Fallback (quota separada do flash normal)
     ]
     
     # Timeout em segundos para chamadas à API
     # Gemini exige mínimo de 10 segundos
     REQUEST_TIMEOUT = 10
     
+    @classmethod
+    def _carregar_api_keys(cls):
+        """Carrega todas as API keys disponíveis do ambiente"""
+        import os
+        
+        if cls._api_keys_disponiveis:
+            return  # Já carregado
+        
+        # Carrega GOOGLE_API_KEY principal
+        key_principal = os.getenv("GOOGLE_API_KEY")
+        if key_principal:
+            cls._api_keys_disponiveis.append(key_principal)
+        
+        # Carrega keys adicionais (GOOGLE_API_KEY_2, GOOGLE_API_KEY_3, etc.)
+        i = 2
+        while True:
+            key = os.getenv(f"GOOGLE_API_KEY_{i}")
+            if key:
+                cls._api_keys_disponiveis.append(key)
+                i += 1
+            else:
+                break
+        
+        if not cls._api_keys_disponiveis:
+            raise ValueError("GOOGLE_API_KEY não encontrada. Configure no arquivo .env")
+        
+        print(f"[GATEWAY] {len(cls._api_keys_disponiveis)} API key(s) carregada(s)")
+    
+    @classmethod
+    def _obter_api_key_atual(cls) -> str:
+        """Retorna a API key atual"""
+        cls._carregar_api_keys()
+        return cls._api_keys_disponiveis[cls._api_key_atual_idx]
+    
+    @classmethod
+    def _trocar_api_key(cls) -> bool:
+        """Tenta trocar para a próxima API key. Retorna True se conseguiu."""
+        cls._carregar_api_keys()
+        
+        if cls._api_key_atual_idx < len(cls._api_keys_disponiveis) - 1:
+            cls._api_key_atual_idx += 1
+            nova_key = cls._api_keys_disponiveis[cls._api_key_atual_idx]
+            # Inicializa set de modelos esgotados para nova key se não existir
+            if nova_key not in cls._modelos_esgotados_por_key:
+                cls._modelos_esgotados_por_key[nova_key] = set()
+            print(f"[GATEWAY] Trocando para API key #{cls._api_key_atual_idx + 1}")
+            return True
+        return False
+    
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
         """
         Inicializa o agente base
         
         Args:
-            api_key: Chave da API do Google Gemini
+            api_key: Chave da API do Google Gemini (opcional, usa do .env)
             model: Nome do modelo a ser usado
         """
         import os
         
-        # Obtém API key
-        if not api_key:
-            api_key = os.getenv("GOOGLE_API_KEY")
-            if not api_key:
-                raise ValueError("GOOGLE_API_KEY não encontrada. Configure no arquivo .env")
+        # Carrega API keys do ambiente
+        BaseAgent._carregar_api_keys()
         
-        self.api_key = api_key
+        # Usa a API key atual do pool
+        self.api_key = api_key if api_key else BaseAgent._obter_api_key_atual()
+        
+        # Inicializa set de modelos esgotados para esta key se não existir
+        if self.api_key not in BaseAgent._modelos_esgotados_por_key:
+            BaseAgent._modelos_esgotados_por_key[self.api_key] = set()
+        self.modelos_esgotados = BaseAgent._modelos_esgotados_por_key[self.api_key]
         
         # Obtém modelo inicial da variável de ambiente ou usa padrão
         if not model:
@@ -57,9 +113,6 @@ class BaseAgent(ABC):
         # Garante que o modelo inicial está na lista de fallback
         if model not in self.MODELOS_FALLBACK:
             self.MODELOS_FALLBACK.insert(0, model)
-        
-        # Usa cache compartilhado de modelos esgotados
-        self.modelos_esgotados = BaseAgent._modelos_esgotados_compartilhado
         
         # Procura o primeiro modelo disponível (não esgotado)
         self.modelo_atual = self._encontrar_modelo_disponivel(model)
@@ -100,8 +153,8 @@ class BaseAgent(ABC):
         return ChatGoogleGenerativeAI(
             model=model,
             google_api_key=self.api_key,
-            temperature=0.7,
-            request_timeout=self.REQUEST_TIMEOUT,  # Timeout curto!
+            temperature=0.2,  # Baixo para respostas mais consistentes e precisas
+            request_timeout=self.REQUEST_TIMEOUT,
         )
     
     def registrar_tools(self, tools: List[Callable]):
@@ -119,13 +172,14 @@ class BaseAgent(ABC):
     def _trocar_modelo(self) -> bool:
         """
         Tenta trocar para o próximo modelo disponível da lista de fallback.
-        Retorna True se conseguiu trocar, False se não há mais modelos.
+        Se todos os modelos da API key atual esgotarem, tenta a próxima API key.
+        Retorna True se conseguiu trocar, False se não há mais opções.
         """
         # Marca o modelo atual como esgotado
         modelo_anterior = self.modelo_atual
         self.modelos_esgotados.add(self.modelo_atual)
         
-        # Procura o próximo modelo disponível
+        # Procura o próximo modelo disponível na key atual
         for idx in range(self.modelo_atual_idx + 1, len(self.MODELOS_FALLBACK)):
             modelo_candidato = self.MODELOS_FALLBACK[idx]
             if modelo_candidato not in self.modelos_esgotados:
@@ -140,12 +194,65 @@ class BaseAgent(ABC):
                 print(f"[GATEWAY] Modelo trocado: {modelo_anterior} → {self.modelo_atual}")
                 return True
         
+        # Todos os modelos desta API key esgotaram - tenta próxima key
+        if BaseAgent._trocar_api_key():
+            # Atualiza referências para nova API key
+            self.api_key = BaseAgent._obter_api_key_atual()
+            
+            # Inicializa set para nova key se necessário
+            if self.api_key not in BaseAgent._modelos_esgotados_por_key:
+                BaseAgent._modelos_esgotados_por_key[self.api_key] = set()
+            self.modelos_esgotados = BaseAgent._modelos_esgotados_por_key[self.api_key]
+            
+            # Reinicia com o primeiro modelo
+            self.modelo_atual_idx = 0
+            self.modelo_atual = self.MODELOS_FALLBACK[0]
+            self.llm = self._criar_llm(self.modelo_atual)
+            
+            # Atualiza LLM com tools se existirem
+            if self.tools:
+                self.llm_with_tools = self.llm.bind_tools(self.tools)
+            
+            print(f"[GATEWAY] Nova API key - usando modelo: {self.modelo_atual}")
+            return True
+        
         return False
+    
+    def _sincronizar_com_estado_compartilhado(self):
+        """
+        Sincroniza as referências locais do agente com o estado compartilhado.
+        Isso é necessário porque quando a API key muda em um agente, 
+        outros agentes precisam atualizar suas referências.
+        """
+        # Obtém a API key atual do pool compartilhado
+        api_key_atual = BaseAgent._obter_api_key_atual()
+        
+        # Se a API key mudou, atualiza todas as referências
+        if self.api_key != api_key_atual:
+            print(f"[GATEWAY] Sincronizando agente com API key #{BaseAgent._api_key_atual_idx + 1}")
+            self.api_key = api_key_atual
+            
+            # Atualiza referência para o set de modelos esgotados da key atual
+            if self.api_key not in BaseAgent._modelos_esgotados_por_key:
+                BaseAgent._modelos_esgotados_por_key[self.api_key] = set()
+            self.modelos_esgotados = BaseAgent._modelos_esgotados_por_key[self.api_key]
+            
+            # Reinicia índice do modelo para o primeiro disponível
+            self.modelo_atual_idx = 0
+            self.modelo_atual = self._encontrar_modelo_disponivel(self.MODELOS_FALLBACK[0])
+            
+            # Recria o LLM com a nova API key
+            self.llm = self._criar_llm(self.modelo_atual)
+            if self.tools:
+                self.llm_with_tools = self.llm.bind_tools(self.tools)
     
     def _is_quota_exceeded_error(self, error: Exception) -> bool:
         """Verifica se o erro é de quota excedida (429 RESOURCE_EXHAUSTED)"""
-        error_str = str(error)
-        return "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower()
+        error_str = str(error).lower()
+        is_quota = "429" in error_str or "resource_exhausted" in error_str or "quota" in error_str or "rate limit" in error_str
+        if is_quota:
+            print(f"[GATEWAY] Erro de quota detectado: {str(error)[:100]}")
+        return is_quota
     
     def obter_historico_memoria(self) -> List:
         """Obtém histórico de mensagens da memória"""
@@ -205,7 +312,7 @@ class BaseAgent(ABC):
     
     def invocar_llm(self, mensagens: List, contexto_debug: str = "") -> Any:
         """
-        Invoca o LLM com fallback automático de modelos.
+        Invoca o LLM com fallback automático de modelos e API keys.
         Usa timeout curto para falhar rápido em erros de quota.
         
         Args:
@@ -215,14 +322,20 @@ class BaseAgent(ABC):
         Returns:
             Resposta do LLM
         """
-        max_tentativas = len(self.MODELOS_FALLBACK)
+        # Máximo de tentativas = modelos * API keys disponíveis
+        num_keys = len(BaseAgent._api_keys_disponiveis) if BaseAgent._api_keys_disponiveis else 1
+        max_tentativas = len(self.MODELOS_FALLBACK) * num_keys
         tentativas = 0
         
         while tentativas < max_tentativas:
+            # Sincroniza referências com estado compartilhado atual
+            self._sincronizar_com_estado_compartilhado()
+            
             # Verifica se modelo atual está esgotado antes de tentar
             if self.modelo_atual in self.modelos_esgotados:
+                print(f"[GATEWAY] Modelo {self.modelo_atual} já está esgotado, tentando próximo...")
                 if not self._trocar_modelo():
-                    raise Exception("Todos os modelos estão esgotados.")
+                    raise Exception("Todos os modelos e API keys estão esgotados.")
                 continue
             
             try:
@@ -237,13 +350,31 @@ class BaseAgent(ABC):
                 # Extrai texto da resposta de forma segura
                 texto_resposta = self._extrair_texto_resposta(resposta.content)
                 
-                # Log de debug
-                prompt_resumo = str(mensagens[-1].content)[:200] if mensagens else ""
+                # Log de debug - inclui system prompt e mensagem do usuário
+                system_prompt = ""
+                user_message = ""
+                for msg in mensagens:
+                    if hasattr(msg, 'content'):
+                        if msg.__class__.__name__ == "SystemMessage":
+                            system_prompt = str(msg.content)
+                        elif msg.__class__.__name__ == "HumanMessage":
+                            user_message = str(msg.content)
+                
+                # Formata tool_calls com mais detalhes
+                tool_calls_info = []
+                if resposta.tool_calls:
+                    for tc in resposta.tool_calls:
+                        tool_calls_info.append({
+                            "name": tc["name"],
+                            "args": tc.get("args", {})
+                        })
+                
                 self.debug_info.append({
                     "contexto": contexto_debug,
-                    "prompt": prompt_resumo,
-                    "resposta": texto_resposta[:200] if texto_resposta else "[tool_calls]",
-                    "tool_calls": [tc["name"] for tc in resposta.tool_calls] if resposta.tool_calls else [],
+                    "system_prompt": system_prompt,
+                    "prompt": user_message,
+                    "resposta": texto_resposta[:500] if texto_resposta else "[aguardando resultado de tools]",
+                    "tool_calls": tool_calls_info,
                     "modelo_usado": self.modelo_atual,
                     "tempo_ms": int(tempo * 1000),
                     "erro": None
@@ -253,6 +384,7 @@ class BaseAgent(ABC):
                 
             except Exception as e:
                 tentativas += 1
+                print(f"[GATEWAY] Tentativa {tentativas}/{max_tentativas} falhou: {str(e)[:100]}")
                 
                 if self._is_quota_exceeded_error(e):
                     # Troca de modelo é instantânea
@@ -260,9 +392,19 @@ class BaseAgent(ABC):
                         continue
                     else:
                         erro = f"Todos os modelos esgotados: {', '.join(self.modelos_esgotados)}"
+                        # Extrai system_prompt e user_message para debug
+                        sys_prompt = ""
+                        usr_msg = ""
+                        for msg in mensagens:
+                            if hasattr(msg, 'content'):
+                                if msg.__class__.__name__ == "SystemMessage":
+                                    sys_prompt = str(msg.content)
+                                elif msg.__class__.__name__ == "HumanMessage":
+                                    usr_msg = str(msg.content)
                         self.debug_info.append({
                             "contexto": contexto_debug,
-                            "prompt": str(mensagens[-1].content)[:200] if mensagens else "",
+                            "system_prompt": sys_prompt,
+                            "prompt": usr_msg,
                             "resposta": None,
                             "tool_calls": [],
                             "modelo_usado": self.modelo_atual,
@@ -271,10 +413,19 @@ class BaseAgent(ABC):
                         })
                         raise Exception(erro)
                 else:
-                    # Erro não relacionado a quota
+                    # Erro não relacionado a quota - extrai prompts para debug
+                    sys_prompt = ""
+                    usr_msg = ""
+                    for msg in mensagens:
+                        if hasattr(msg, 'content'):
+                            if msg.__class__.__name__ == "SystemMessage":
+                                sys_prompt = str(msg.content)
+                            elif msg.__class__.__name__ == "HumanMessage":
+                                usr_msg = str(msg.content)
                     self.debug_info.append({
                         "contexto": contexto_debug,
-                        "prompt": str(mensagens[-1].content)[:200] if mensagens else "",
+                        "system_prompt": sys_prompt,
+                        "prompt": usr_msg,
                         "resposta": None,
                         "tool_calls": [],
                         "modelo_usado": self.modelo_atual,
@@ -311,8 +462,8 @@ class BaseAgent(ABC):
         # Adiciona histórico da memória se solicitado
         if usar_memoria:
             historico = self.obter_historico_memoria()
-            # Limita histórico para não exceder contexto
-            mensagens.extend(historico[-10:])  # Últimas 10 mensagens
+            # Limita histórico para não exceder contexto (20 msgs = ~10 turnos de conversa)
+            mensagens.extend(historico[-20:])
         
         mensagens.append(HumanMessage(content=mensagem_usuario))
         
@@ -320,9 +471,12 @@ class BaseAgent(ABC):
         resposta = self.invocar_llm(mensagens, contexto_debug)
         
         tool_calls_executados = []
+        iteracoes = 0
+        max_iteracoes = 5  # Limite de segurança
         
         # Se tem tool_calls, executa as ferramentas
-        while resposta.tool_calls:
+        while resposta.tool_calls and iteracoes < max_iteracoes:
+            iteracoes += 1
             # Adiciona resposta da IA com tool_calls
             mensagens.append(resposta)
             
@@ -330,14 +484,19 @@ class BaseAgent(ABC):
                 tool_name = tool_call["name"]
                 tool_args = tool_call["args"]
                 
+                print(f"[TOOLS] Executando: {tool_name}({tool_args})")
+                
                 # Executa a ferramenta
                 if tool_name in self.tools_by_name:
                     try:
                         tool_result = self.tools_by_name[tool_name].invoke(tool_args)
+                        print(f"[TOOLS] Resultado: {tool_result}")
                     except Exception as e:
                         tool_result = f"Erro ao executar {tool_name}: {str(e)}"
+                        print(f"[TOOLS] Erro: {tool_result}")
                 else:
                     tool_result = f"Ferramenta {tool_name} não encontrada"
+                    print(f"[TOOLS] {tool_result}")
                 
                 tool_calls_executados.append({
                     "name": tool_name,
@@ -351,11 +510,16 @@ class BaseAgent(ABC):
                     tool_call_id=tool_call["id"]
                 ))
             
-            # Chama LLM novamente para gerar resposta final
+            # Chama LLM novamente para gerar resposta final com base no resultado das tools
+            print(f"[TOOLS] Chamando LLM novamente após {len(tool_calls_executados)} tools...")
             resposta = self.invocar_llm(mensagens, f"{contexto_debug} - após tools")
         
         # Extrai texto da resposta de forma segura
         texto_resposta = self._extrair_texto_resposta(resposta.content)
+        
+        if not texto_resposta and tool_calls_executados:
+            print(f"[TOOLS] AVISO: LLM não gerou texto após {len(tool_calls_executados)} tool calls")
+        
         return (texto_resposta, tool_calls_executados)
     
     # ==================== MÉTODOS LEGADOS (para compatibilidade) ====================

@@ -12,34 +12,45 @@ class CreditoAgent(BaseAgent):
     """Agente responsável por consultas de crédito e solicitações de aumento"""
     
     # Prompt de sistema que explica o contexto e responsabilidades
-    SYSTEM_PROMPT = """Você é o Agente de Crédito de um banco digital. Você é responsável por:
-- Consultar limite de crédito do cliente
-- Processar solicitações de aumento de limite
-- Redirecionar para outros agentes quando necessário
+    SYSTEM_PROMPT = """Você é um assistente de crédito de um banco digital.
 
-CONTEXTO DO SISTEMA BANCÁRIO:
-O sistema possui múltiplos agentes especializados:
-- Você (Agente de Crédito): Limite e aumento de crédito
-- Agente de Câmbio: Cotações de moedas (dólar, euro, etc.)
-- Agente de Entrevista: Entrevista para atualizar score de crédito
-
-SUAS FERRAMENTAS DISPONÍVEIS:
-1. consultar_limite_credito(cpf) - Consulta o limite atual do cliente
-2. solicitar_aumento_limite(cpf, novo_limite) - Processa solicitação de aumento
-3. redirecionar_para_cambio() - Quando cliente quer cotação de moedas
-4. redirecionar_para_entrevista() - Quando cliente quer fazer entrevista
-
-INSTRUÇÕES:
-1. Se o cliente pergunta sobre seu limite → use consultar_limite_credito
-2. Se o cliente quer aumentar o limite → extraia o valor e use solicitar_aumento_limite
-3. Se o cliente pergunta sobre moedas/cotação → use redirecionar_para_cambio
-4. Se o cliente quer fazer entrevista/melhorar score → use redirecionar_para_entrevista
-5. Se não entendeu claramente → pergunte educadamente
-
-DADOS DO CLIENTE ATUAL:
+DADOS DO CLIENTE (JÁ AUTENTICADO - NÃO PEÇA CPF NOVAMENTE!):
 {dados_cliente}
 
-Seja natural, amigável e profissional. Responda em português do Brasil."""
+SUAS FERRAMENTAS:
+1. consultar_limite_credito(cpf) - Consulta o limite atual
+2. solicitar_aumento_limite(cpf, novo_limite) - Processa solicitação de aumento
+3. redirecionar_para_cambio() - Quando cliente pergunta sobre moedas
+4. redirecionar_para_entrevista() - Inicia entrevista de crédito
+
+REGRAS OBRIGATÓRIAS:
+1. NUNCA peça CPF ou dados de identificação - o cliente JÁ está autenticado
+2. Execute tools imediatamente - NUNCA diga "vou consultar" ou "um momento"
+3. A entrevista é IMEDIATA, não "agendada" - diga "podemos fazer agora"
+4. Quando cliente ACEITAR entrevista → use a tool SEM dizer que está transferindo
+
+FLUXO PARA AUMENTO DE LIMITE:
+1. Cliente menciona que quer algo caro → consulte o limite atual
+2. Se limite insuficiente → pergunte se quer solicitar aumento
+3. Cliente CONFIRMA (sim, s, ok, quero, pode) → use solicitar_aumento_limite COM O VALOR mencionado
+4. Se REJEITADO → ofereça entrevista: "Podemos fazer uma análise rápida agora para aumentar seu limite"
+5. Cliente ACEITA entrevista → use redirecionar_para_entrevista IMEDIATAMENTE
+
+CONFIRMAÇÕES CURTAS:
+- "S", "sim", "ok", "quero", "pode", "claro" = CONFIRMAÇÃO → execute a ação
+- Use o VALOR mencionado anteriormente no histórico
+
+PROIBIDO:
+- NUNCA mencione "transferir", "outro agente", "outra área"
+- A transição deve ser INVISÍVEL - apenas continue a conversa naturalmente
+- NUNCA peça dados que já tem (CPF, nome, etc.)
+
+LEMBRE-SE:
+- Use o CPF dos DADOS DO CLIENTE nas tools
+- LEIA O HISTÓRICO para valores mencionados antes
+- Se cliente disser "já falei" → procure no histórico
+
+Seja natural e profissional. Responda em português do Brasil."""
 
     def __init__(self, api_key: Optional[str] = None):
         super().__init__(api_key)
@@ -93,8 +104,12 @@ Seja natural, amigável e profissional. Responda em português do Brasil."""
                 usar_memoria=True
             )
             
-            # Verifica se houve redirecionamento
+            # Processa resultados das tool calls
+            ultima_mensagem_tool = None
+            
             for tc in tool_calls:
+                print(f"[CreditoAgent] Tool executada: {tc['name']} -> {tc['result']}")
+                
                 if tc["name"] == "redirecionar_para_cambio":
                     return {
                         "resposta": "",
@@ -109,11 +124,30 @@ Seja natural, amigável e profissional. Responda em português do Brasil."""
                     }
                 elif tc["name"] == "solicitar_aumento_limite":
                     result = tc["result"]
-                    if isinstance(result, dict) and result.get("sugerir_entrevista"):
-                        self.entrevista_oferecida = True
+                    if isinstance(result, dict):
+                        if result.get("sugerir_entrevista"):
+                            self.entrevista_oferecida = True
+                            ultima_mensagem_tool = result.get("mensagem", "")
+                        elif result.get("aprovado"):
+                            ultima_mensagem_tool = result.get("mensagem", "Aumento aprovado!")
+                        else:
+                            ultima_mensagem_tool = result.get("mensagem", "")
+                elif tc["name"] == "consultar_limite_credito":
+                    result = tc["result"]
+                    if isinstance(result, dict) and result.get("sucesso"):
+                        limite = result.get("limite_formatado", "")
+                        ultima_mensagem_tool = f"Seu limite atual é de {limite}."
             
-            # Usa a resposta do LLM diretamente
-            resposta_final = resposta_texto if resposta_texto else "Como posso ajudá-lo com questões de crédito?"
+            # Usa resposta do LLM, ou fallback baseado na tool
+            if resposta_texto:
+                resposta_final = resposta_texto
+            elif ultima_mensagem_tool:
+                resposta_final = ultima_mensagem_tool
+            elif tool_calls:
+                # Teve tool call mas sem resposta - força uma nova chamada
+                resposta_final = "Processado! Como posso ajudar mais?"
+            else:
+                resposta_final = "Como posso ajudá-lo com questões de crédito?"
             
             # Salva na memória
             self.adicionar_a_memoria(mensagem, resposta_final)
