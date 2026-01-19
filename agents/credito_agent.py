@@ -14,14 +14,15 @@ class CreditoAgent(BaseAgent):
     # Prompt de sistema que explica o contexto e responsabilidades
     SYSTEM_PROMPT = """Você é um assistente de crédito de um banco digital.
 
-DADOS DO CLIENTE (JÁ AUTENTICADO - NÃO PEÇA CPF NOVAMENTE!):
+DADOS DO CLIENTE (JÁ AUTENTICADO):
 {dados_cliente}
 
-SUAS FERRAMENTAS:
-1. consultar_limite_credito(cpf) - Consulta o limite atual
-2. solicitar_aumento_limite(cpf, novo_limite) - Processa solicitação de aumento
-3. redirecionar_para_cambio() - Quando cliente pergunta sobre moedas
-4. redirecionar_para_entrevista() - Inicia entrevista de crédito
+FERRAMENTAS DISPONÍVEIS:
+- consultar_limite_credito(cpf) - Consulta o limite atual
+- solicitar_aumento_limite(cpf, novo_limite) - Processa solicitação de aumento
+- redirecionar_para_cambio() - Para cotação de moedas
+- redirecionar_para_entrevista() - Para entrevista de crédito
+- encerrar_conversa(mensagem_despedida) - Encerra a conversa quando o cliente quiser sair
 
 REGRAS OBRIGATÓRIAS:
 1. NUNCA peça CPF ou dados de identificação - o cliente JÁ está autenticado
@@ -39,6 +40,12 @@ FLUXO PARA AUMENTO DE LIMITE:
 CONFIRMAÇÕES CURTAS:
 - "S", "sim", "ok", "quero", "pode", "claro" = CONFIRMAÇÃO → execute a ação
 - Use o VALOR mencionado anteriormente no histórico
+
+IMPORTANTE - NÃO INVENTAR FUNCIONALIDADES:
+- Você só pode fazer o que as FERRAMENTAS DISPONÍVEIS permitem
+- NÃO existe financiamento de veículos, empréstimos ou outras opções
+- O sistema só oferece: consulta de limite, aumento de limite e entrevista de crédito
+- Se o cliente pedir algo que não existe, diga que não está disponível
 
 PROIBIDO:
 - NUNCA mencione "transferir", "outro agente", "outra área"
@@ -76,13 +83,7 @@ Seja natural e profissional. Responda em português do Brasil."""
                 "encerrar": False
             }
         
-        # Verifica encerramento
-        if self._verificar_encerramento(mensagem):
-            return {
-                "resposta": "Foi um prazer ajudá-lo! Até logo!",
-                "proximo_agente": None,
-                "encerrar": True
-            }
+        # Encerramento agora é controlado pelo LLM via tool encerrar_conversa
         
         # Monta dados do cliente para o prompt
         limite_atual = float(self.cliente.get('limite_credito', 0))
@@ -96,32 +97,38 @@ Seja natural e profissional. Responda em português do Brasil."""
         prompt_sistema = self.SYSTEM_PROMPT.format(dados_cliente=dados_cliente)
         
         try:
+            # Verifica se Chain-of-Thought está ativado
+            cot_enabled = contexto.get("config", {}).get("chain_of_thought", False)
+            
             # Processa usando Tool Calling
-            resposta_texto, tool_calls = self.processar_com_tools(
+            resposta_texto, tool_calls, encerrar_flag, mensagem_despedida = self.processar_com_tools(
                 prompt_sistema=prompt_sistema,
                 mensagem_usuario=mensagem,
                 contexto_debug="CreditoAgent.processar",
-                usar_memoria=True
+                usar_memoria=True,
+                chain_of_thought=cot_enabled
             )
             
-            # Processa resultados das tool calls
+            # Se a tool encerrar_conversa foi chamada, retorna imediatamente
+            if encerrar_flag:
+                self.adicionar_a_memoria(mensagem, mensagem_despedida or resposta_texto)
+                return {
+                    "resposta": mensagem_despedida or resposta_texto or "Foi um prazer ajudá-lo! Até logo!",
+                    "proximo_agente": None,
+                    "encerrar": True
+                }
+            
+            # Processa resultados das tool calls - primeiro coleta tudo, depois decide
             ultima_mensagem_tool = None
+            proximo_agente = None
             
             for tc in tool_calls:
                 print(f"[CreditoAgent] Tool executada: {tc['name']} -> {tc['result']}")
                 
                 if tc["name"] == "redirecionar_para_cambio":
-                    return {
-                        "resposta": "",
-                        "proximo_agente": "cambio",
-                        "encerrar": False
-                    }
+                    proximo_agente = "cambio"
                 elif tc["name"] == "redirecionar_para_entrevista":
-                    return {
-                        "resposta": "",
-                        "proximo_agente": "entrevista",
-                        "encerrar": False
-                    }
+                    proximo_agente = "entrevista"
                 elif tc["name"] == "solicitar_aumento_limite":
                     result = tc["result"]
                     if isinstance(result, dict):
@@ -138,16 +145,24 @@ Seja natural e profissional. Responda em português do Brasil."""
                         limite = result.get("limite_formatado", "")
                         ultima_mensagem_tool = f"Seu limite atual é de {limite}."
             
-            # Usa resposta do LLM, ou fallback baseado na tool
+            # Monta resposta final
             if resposta_texto:
                 resposta_final = resposta_texto
             elif ultima_mensagem_tool:
                 resposta_final = ultima_mensagem_tool
             elif tool_calls:
-                # Teve tool call mas sem resposta - força uma nova chamada
                 resposta_final = "Processado! Como posso ajudar mais?"
             else:
                 resposta_final = "Como posso ajudá-lo com questões de crédito?"
+            
+            # Se houve redirecionamento, retorna com a resposta (não vazia!)
+            if proximo_agente:
+                self.adicionar_a_memoria(mensagem, resposta_final)
+                return {
+                    "resposta": resposta_final,
+                    "proximo_agente": proximo_agente,
+                    "encerrar": False
+                }
             
             # Salva na memória
             self.adicionar_a_memoria(mensagem, resposta_final)

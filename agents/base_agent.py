@@ -28,6 +28,7 @@ class BaseAgent(ABC):
     # Nota: Modelos 2.0 compartilham quota com 2.5, então só usamos 2.5
     # Nota: Gemma NÃO suporta Function Calling
     MODELOS_FALLBACK = [
+        "gemini-3-flash-preview",     # Novo - testando (Gemini 3!)
         "gemini-2.5-flash",           # Principal - melhor qualidade
         "gemini-2.5-flash-lite",      # Fallback (quota separada do flash normal)
     ]
@@ -153,7 +154,7 @@ class BaseAgent(ABC):
         return ChatGoogleGenerativeAI(
             model=model,
             google_api_key=self.api_key,
-            temperature=0.2,  # Baixo para respostas mais consistentes e precisas
+            temperature=0.5,  # Baixo para respostas mais consistentes e precisas
             request_timeout=self.REQUEST_TIMEOUT,
         )
     
@@ -350,15 +351,27 @@ class BaseAgent(ABC):
                 # Extrai texto da resposta de forma segura
                 texto_resposta = self._extrair_texto_resposta(resposta.content)
                 
-                # Log de debug - inclui system prompt e mensagem do usuário
+                # Log de debug - extrai informações relevantes das mensagens
                 system_prompt = ""
                 user_message = ""
+                tool_results = []
+                
                 for msg in mensagens:
                     if hasattr(msg, 'content'):
-                        if msg.__class__.__name__ == "SystemMessage":
+                        msg_type = msg.__class__.__name__
+                        if msg_type == "SystemMessage":
                             system_prompt = str(msg.content)
-                        elif msg.__class__.__name__ == "HumanMessage":
+                        elif msg_type == "HumanMessage":
                             user_message = str(msg.content)
+                        elif msg_type == "ToolMessage":
+                            # Captura resultados das tools
+                            tool_results.append(str(msg.content)[:200])
+                
+                # Se tem resultados de tools, mostra como input principal
+                if tool_results:
+                    input_display = f"[Tool Results]\n" + "\n---\n".join(tool_results)
+                else:
+                    input_display = user_message
                 
                 # Formata tool_calls com mais detalhes
                 tool_calls_info = []
@@ -372,7 +385,7 @@ class BaseAgent(ABC):
                 self.debug_info.append({
                     "contexto": contexto_debug,
                     "system_prompt": system_prompt,
-                    "prompt": user_message,
+                    "prompt": input_display,
                     "resposta": texto_resposta[:500] if texto_resposta else "[aguardando resultado de tools]",
                     "tool_calls": tool_calls_info,
                     "modelo_usado": self.modelo_atual,
@@ -441,7 +454,8 @@ class BaseAgent(ABC):
         prompt_sistema: str, 
         mensagem_usuario: str,
         contexto_debug: str = "",
-        usar_memoria: bool = True
+        usar_memoria: bool = True,
+        chain_of_thought: bool = False
     ) -> tuple:
         """
         Processa mensagem usando o sistema de Tool Calling nativo.
@@ -451,12 +465,25 @@ class BaseAgent(ABC):
             mensagem_usuario: Mensagem do usuário
             contexto_debug: Contexto para debug
             usar_memoria: Se deve incluir histórico da memória
+            chain_of_thought: Se deve usar a tool responder_usuario para raciocínio
             
         Returns:
-            tuple: (resposta_texto, tool_calls_executados)
+            tuple: (resposta_texto, tool_calls_executados, encerrar_conversa_flag, mensagem_despedida)
                 - resposta_texto: Texto final da resposta
                 - tool_calls_executados: Lista de dicts com {name, args, result}
+                - encerrar_conversa_flag: True se a tool encerrar_conversa foi chamada
+                - mensagem_despedida: Mensagem de despedida (se houver)
         """
+        # Ajusta o prompt se Chain-of-Thought estiver ativado
+        if chain_of_thought:
+            prompt_cot = """
+IMPORTANTE - CHAIN OF THOUGHT:
+Ao responder o cliente, use a ferramenta responder_usuario com:
+- raciocinio: explique seu pensamento interno (não será mostrado ao usuário)
+- resposta: a mensagem final para o cliente
+"""
+            prompt_sistema = prompt_sistema + prompt_cot
+        
         mensagens = [SystemMessage(content=prompt_sistema)]
         
         # Adiciona histórico da memória se solicitado
@@ -473,6 +500,10 @@ class BaseAgent(ABC):
         tool_calls_executados = []
         iteracoes = 0
         max_iteracoes = 5  # Limite de segurança
+        resposta_usuario_encontrada = None  # Para detectar tool responder_usuario
+        raciocinio = None  # Para armazenar o raciocínio (Chain-of-Thought)
+        encerrar_conversa_flag = False  # Para detectar tool encerrar_conversa
+        mensagem_despedida = None  # Mensagem de despedida
         
         # Se tem tool_calls, executa as ferramentas
         while resposta.tool_calls and iteracoes < max_iteracoes:
@@ -484,24 +515,51 @@ class BaseAgent(ABC):
                 tool_name = tool_call["name"]
                 tool_args = tool_call["args"]
                 
-                print(f"[TOOLS] Executando: {tool_name}({tool_args})")
-                
-                # Executa a ferramenta
-                if tool_name in self.tools_by_name:
-                    try:
-                        tool_result = self.tools_by_name[tool_name].invoke(tool_args)
-                        print(f"[TOOLS] Resultado: {tool_result}")
-                    except Exception as e:
-                        tool_result = f"Erro ao executar {tool_name}: {str(e)}"
-                        print(f"[TOOLS] Erro: {tool_result}")
+                # Caso especial: responder_usuario é a resposta final
+                if tool_name == "responder_usuario":
+                    raciocinio = tool_args.get("raciocinio", "")
+                    resposta_usuario_encontrada = tool_args.get("resposta", "")
+                    print(f"\n[TOOLS] 💭 RACIOCÍNIO (Chain-of-Thought):")
+                    print(f"   {raciocinio}")
+                    print(f"\n[TOOLS] 💬 RESPOSTA:")
+                    print(f"   {resposta_usuario_encontrada}\n")
+                    
+                    tool_result = {
+                        "tipo": "resposta_usuario",
+                        "raciocinio": raciocinio,
+                        "resposta": resposta_usuario_encontrada
+                    }
+                # Caso especial: encerrar_conversa
+                elif tool_name == "encerrar_conversa":
+                    encerrar_conversa_flag = True
+                    mensagem_despedida = tool_args.get("mensagem_despedida", "Foi um prazer ajudá-lo! Até logo!")
+                    print(f"[TOOLS] 🚪 Encerrando conversa: {mensagem_despedida}")
+                    
+                    tool_result = {
+                        "acao": "encerrar",
+                        "mensagem": mensagem_despedida
+                    }
                 else:
-                    tool_result = f"Ferramenta {tool_name} não encontrada"
-                    print(f"[TOOLS] {tool_result}")
+                    print(f"[TOOLS] 🔧 Executando: {tool_name}")
+                    print(f"   Args: {tool_args}")
+                    
+                    # Executa a ferramenta
+                    if tool_name in self.tools_by_name:
+                        try:
+                            tool_result = self.tools_by_name[tool_name].invoke(tool_args)
+                            print(f"   Resultado: {tool_result}")
+                        except Exception as e:
+                            tool_result = f"Erro ao executar {tool_name}: {str(e)}"
+                            print(f"[TOOLS] Erro: {tool_result}")
+                    else:
+                        tool_result = f"Ferramenta {tool_name} não encontrada"
+                        print(f"[TOOLS] {tool_result}")
                 
                 tool_calls_executados.append({
                     "name": tool_name,
                     "args": tool_args,
-                    "result": tool_result
+                    "result": tool_result,
+                    "raciocinio": raciocinio if tool_name == "responder_usuario" else None
                 })
                 
                 # Adiciona resultado da ferramenta às mensagens
@@ -510,17 +568,33 @@ class BaseAgent(ABC):
                     tool_call_id=tool_call["id"]
                 ))
             
+            # Se encontrou responder_usuario, não precisa chamar LLM novamente
+            if resposta_usuario_encontrada:
+                break
+            
             # Chama LLM novamente para gerar resposta final com base no resultado das tools
             print(f"[TOOLS] Chamando LLM novamente após {len(tool_calls_executados)} tools...")
             resposta = self.invocar_llm(mensagens, f"{contexto_debug} - após tools")
         
-        # Extrai texto da resposta de forma segura
-        texto_resposta = self._extrair_texto_resposta(resposta.content)
+        # Se usou responder_usuario, essa é a resposta final
+        if resposta_usuario_encontrada:
+            texto_resposta = resposta_usuario_encontrada
+        else:
+            # Extrai texto da resposta de forma segura (fallback para modo antigo)
+            texto_resposta = self._extrair_texto_resposta(resposta.content)
         
         if not texto_resposta and tool_calls_executados:
             print(f"[TOOLS] AVISO: LLM não gerou texto após {len(tool_calls_executados)} tool calls")
         
-        return (texto_resposta, tool_calls_executados)
+        # Atualiza o último debug_info com os tool_calls processados (inclui raciocínio)
+        if self.debug_info and tool_calls_executados:
+            # Encontra o último debug entry e atualiza com tool_calls completos
+            self.debug_info[-1]["tool_calls_completos"] = tool_calls_executados
+            # Se houve raciocínio, adiciona ao debug
+            if raciocinio:
+                self.debug_info[-1]["raciocinio"] = raciocinio
+        
+        return (texto_resposta, tool_calls_executados, encerrar_conversa_flag, mensagem_despedida)
     
     # ==================== MÉTODOS LEGADOS (para compatibilidade) ====================
     

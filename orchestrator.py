@@ -36,12 +36,13 @@ class Orchestrator:
         # Inicia com agente de triagem
         self.agente_atual = self.agente_triagem
     
-    def processar_mensagem(self, mensagem: str) -> Dict[str, Any]:
+    def processar_mensagem(self, mensagem: str, config: Dict[str, Any] = None) -> Dict[str, Any]:
         """
         Processa mensagem do usuário e retorna resposta
         
         Args:
             mensagem: Mensagem do usuário
+            config: Configurações opcionais (ex: chain_of_thought)
             
         Returns:
             Dict com:
@@ -51,6 +52,9 @@ class Orchestrator:
                 - debug_info: list - Informações de debug (prompts e respostas do LLM)
                 - erro: str - Mensagem de erro se houver
         """
+        # Aplica configurações ao contexto
+        if config:
+            self.contexto["config"] = config
         debug_info = []
         erro = None
         
@@ -78,20 +82,28 @@ class Orchestrator:
             proximo_agente_nome = resultado.get("proximo_agente")
             
             if proximo_agente_nome:
+                resposta_anterior = resultado.get("resposta", "").strip()
                 self._trocar_agente(proximo_agente_nome, resultado.get("cliente"))
-                # Reprocessa a mensagem com o novo agente para que ele possa responder adequadamente
-                # Apenas reprocessa se a resposta anterior estava vazia (indicando redirecionamento)
-                if not resultado.get("resposta") or resultado.get("resposta").strip() == "":
-                    # Limpa debug_info do novo agente antes de processar
-                    if hasattr(self.agente_atual, 'resetar_debug_info'):
-                        self.agente_atual.resetar_debug_info()
-                    
-                    resultado = self.agente_atual.processar(mensagem, self.contexto)
-                    # Coleta informações de debug do novo agente também
-                    if hasattr(self.agente_atual, 'obter_debug_info'):
-                        debug_info_temp = self.agente_atual.obter_debug_info()
-                        if debug_info_temp:
-                            debug_info.extend(debug_info_temp)
+                
+                # Sempre reprocessa com o novo agente
+                if hasattr(self.agente_atual, 'resetar_debug_info'):
+                    self.agente_atual.resetar_debug_info()
+                
+                resultado_novo = self.agente_atual.processar(mensagem, self.contexto)
+                
+                # Coleta informações de debug do novo agente
+                if hasattr(self.agente_atual, 'obter_debug_info'):
+                    debug_info_temp = self.agente_atual.obter_debug_info()
+                    if debug_info_temp:
+                        debug_info.extend(debug_info_temp)
+                
+                # Decide qual resposta usar:
+                # - Se o novo agente respondeu algo, usa a resposta dele (mais completa/atualizada)
+                # - Se não, mantém a resposta anterior
+                nova_resposta = resultado_novo.get("resposta", "").strip()
+                if nova_resposta:
+                    resultado = resultado_novo
+                # Se o novo agente não respondeu mas o anterior sim, mantém resultado anterior
             
             # Adiciona ao histórico
             self.contexto["historico"].append({

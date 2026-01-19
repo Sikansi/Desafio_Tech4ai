@@ -28,25 +28,21 @@ class TriagemAgent(BaseAgent):
         """Gera o prompt de sistema baseado na etapa atual"""
         etapa = self.estado["etapa"]
         
-        base_prompt = """Você é o Agente de Triagem de um banco digital. Você é responsável por:
+        base_prompt = """Você é o Agente de Triagem de um banco digital.
+
+SUAS RESPONSABILIDADES:
 - Receber e autenticar clientes
 - Identificar a necessidade do cliente após autenticação
 - Direcionar para o agente especializado correto
 
-CONTEXTO DO SISTEMA BANCÁRIO:
-O sistema possui múltiplos agentes especializados:
-- Você (Agente de Triagem): Autenticação e direcionamento
-- Agente de Crédito: Limite e aumento de crédito
-- Agente de Câmbio: Cotações de moedas (dólar, euro, etc.)
-- Agente de Entrevista: Entrevista para atualizar score de crédito
-
-SUAS FERRAMENTAS DISPONÍVEIS:
-1. validar_cpf(cpf) - Valida e extrai CPF da mensagem
-2. validar_data_nascimento(data) - Valida data de nascimento
-3. autenticar_cliente_tool(cpf, data_nascimento) - Autentica o cliente
-4. redirecionar_para_credito() - Direciona para questões de crédito/limite
-5. redirecionar_para_cambio() - Direciona para cotação de moedas
-6. redirecionar_para_entrevista() - Direciona para entrevista de crédito
+FERRAMENTAS DISPONÍVEIS:
+- validar_cpf(cpf) - Valida CPF
+- validar_data_nascimento(data) - Valida data de nascimento
+- autenticar_cliente_tool(cpf, data_nascimento) - Autentica o cliente
+- redirecionar_para_credito() - Para questões de crédito/limite
+- redirecionar_para_cambio() - Para cotação de moedas
+- redirecionar_para_entrevista() - Para entrevista de crédito
+- encerrar_conversa(mensagem_despedida) - Encerra a conversa quando o cliente quiser sair
 
 """
         
@@ -119,24 +115,29 @@ Seja natural e prestativo. Responda em português do Brasil."""
     def processar(self, mensagem: str, contexto: Dict[str, Any]) -> Dict[str, Any]:
         """Processa mensagem do usuário no fluxo de triagem"""
         
-        # Verifica se usuário quer encerrar
-        if self._verificar_encerramento(mensagem):
-            return {
-                "resposta": "Entendido! Foi um prazer atendê-lo. Até logo!",
-                "proximo_agente": None,
-                "autenticado": False,
-                "cliente": None,
-                "encerrar": True
-            }
+        # Encerramento agora é controlado pelo LLM via tool encerrar_conversa
         
         try:
+            # Verifica se Chain-of-Thought está ativado
+            cot_enabled = contexto.get("config", {}).get("chain_of_thought", False)
+            
             # Processa usando Tool Calling
-            resposta_texto, tool_calls = self.processar_com_tools(
+            resposta_texto, tool_calls, encerrar_flag, mensagem_despedida = self.processar_com_tools(
                 prompt_sistema=self._get_system_prompt(),
                 mensagem_usuario=mensagem,
                 contexto_debug=f"TriagemAgent.processar - etapa: {self.estado['etapa']}",
-                usar_memoria=True
+                usar_memoria=True,
+                chain_of_thought=cot_enabled
             )
+            
+            # Se a tool encerrar_conversa foi chamada, retorna imediatamente
+            if encerrar_flag:
+                self.adicionar_a_memoria(mensagem, mensagem_despedida or resposta_texto)
+                return {
+                    "resposta": mensagem_despedida or resposta_texto or "Foi um prazer ajudá-lo! Até logo!",
+                    "proximo_agente": None,
+                    "encerrar": True
+                }
             
             # Processa resultados das tools
             proximo_agente = None
@@ -186,16 +187,6 @@ Seja natural e prestativo. Responda em português do Brasil."""
                             self.estado["data_nascimento"] = None
                             self.estado["etapa"] = "coletando_cpf"
             
-            # Se houve redirecionamento
-            if proximo_agente:
-                return {
-                    "resposta": "",
-                    "proximo_agente": proximo_agente,
-                    "autenticado": self.estado["etapa"] == "autenticado",
-                    "cliente": self.estado.get("cliente"),
-                    "encerrar": False
-                }
-            
             # Monta resposta final - usa a resposta do LLM diretamente
             if resposta_texto and resposta_texto.strip():
                 resposta_final = resposta_texto
@@ -221,6 +212,16 @@ Seja natural e prestativo. Responda em português do Brasil."""
             
             # Salva na memória
             self.adicionar_a_memoria(mensagem, resposta_final)
+            
+            # Se houve redirecionamento, usa a resposta montada (não vazia!)
+            if proximo_agente:
+                return {
+                    "resposta": resposta_final,
+                    "proximo_agente": proximo_agente,
+                    "autenticado": self.estado["etapa"] == "autenticado",
+                    "cliente": self.estado.get("cliente"),
+                    "encerrar": False
+                }
             
             return {
                 "resposta": resposta_final,

@@ -14,6 +14,24 @@ from utils.cotacao_api import buscar_cotacao_moeda
 from utils.score_calculator import calcular_score
 
 
+# ==================== TOOL DE RESPOSTA (Chain-of-Thought estruturado) ====================
+
+@tool
+def responder_usuario(raciocinio: str, resposta: str) -> dict:
+    """
+    Envia uma resposta ao usuário após raciocinar sobre a situação.
+    
+    Args:
+        raciocinio: Pensamento interno sobre o que fazer (não mostrado ao usuário)
+        resposta: Texto final para o usuário
+    """
+    return {
+        "tipo": "resposta_usuario",
+        "raciocinio": raciocinio,
+        "resposta": resposta
+    }
+
+
 # ==================== TOOLS DE NAVEGAÇÃO (usadas por todos os agentes) ====================
 
 @tool
@@ -49,6 +67,20 @@ def redirecionar_para_entrevista() -> dict:
     - Melhorar avaliação de crédito
     """
     return {"acao": "redirecionar", "agente": "entrevista"}
+
+
+@tool
+def encerrar_conversa(mensagem_despedida: str = "Foi um prazer ajudá-lo! Até logo!") -> dict:
+    """
+    Encerra a conversa com o cliente.
+    Use quando:
+    - O cliente quiser sair (disser "tchau", "até logo", "encerrar", "sair", etc.)
+    - O cliente agradecer e se despedir
+    
+    Args:
+        mensagem_despedida: Mensagem de despedida personalizada (opcional)
+    """
+    return {"acao": "encerrar", "mensagem": mensagem_despedida}
 
 
 # ==================== TOOLS DO AGENTE DE CRÉDITO ====================
@@ -518,37 +550,44 @@ def autenticar_cliente_tool(cpf: str, data_nascimento: str) -> dict:
 def get_tools_triagem():
     """Retorna tools disponíveis para o Agente de Triagem"""
     return [
+        responder_usuario,  # OBRIGATÓRIO para todas as respostas
         validar_cpf,
         validar_data_nascimento,
         autenticar_cliente_tool,
         redirecionar_para_credito,
         redirecionar_para_cambio,
         redirecionar_para_entrevista,
+        encerrar_conversa,
     ]
 
 
 def get_tools_credito():
     """Retorna tools disponíveis para o Agente de Crédito"""
     return [
+        responder_usuario,  # OBRIGATÓRIO para todas as respostas
         consultar_limite_credito,
         solicitar_aumento_limite,
         redirecionar_para_cambio,
         redirecionar_para_entrevista,
+        encerrar_conversa,
     ]
 
 
 def get_tools_cambio():
     """Retorna tools disponíveis para o Agente de Câmbio"""
     return [
+        responder_usuario,  # OBRIGATÓRIO para todas as respostas
         consultar_cotacao_moeda,
         redirecionar_para_credito,
         redirecionar_para_entrevista,
+        encerrar_conversa,
     ]
 
 
 def get_tools_entrevista():
     """Retorna tools disponíveis para o Agente de Entrevista"""
     return [
+        responder_usuario,  # OBRIGATÓRIO para todas as respostas
         registrar_renda_mensal,
         registrar_tipo_emprego,
         registrar_despesas_fixas,
@@ -557,4 +596,5 @@ def get_tools_entrevista():
         calcular_novo_score,
         redirecionar_para_credito,
         redirecionar_para_cambio,
+        encerrar_conversa,
     ]

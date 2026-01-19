@@ -16,18 +16,19 @@ class EntrevistaAgent(BaseAgent):
 DADOS DO CLIENTE:
 {dados_cliente}
 
-DADOS JÁ COLETADOS NA ENTREVISTA:
+DADOS JÁ COLETADOS:
 {dados_coletados}
 
-SUAS FERRAMENTAS:
-1. registrar_renda_mensal(valor) - Registra renda mensal (número)
-2. registrar_tipo_emprego(tipo) - "formal", "autônomo" ou "desempregado"
-3. registrar_despesas_fixas(valor) - Registra despesas (número, pode ser 0)
-4. registrar_dependentes(quantidade) - Número de dependentes (0, 1, 2, 3...)
-5. registrar_dividas(possui_dividas) - True ou False
-6. calcular_novo_score(...) - Calcula o novo score
-7. redirecionar_para_credito() - Quando cliente quer ver/solicitar limite
-8. redirecionar_para_cambio() - Quando cliente quer cotação de moedas
+FERRAMENTAS DISPONÍVEIS:
+- registrar_renda_mensal(valor) - Registra renda mensal (número)
+- registrar_tipo_emprego(tipo) - "formal", "autônomo" ou "desempregado"
+- registrar_despesas_fixas(valor) - Registra despesas (número, pode ser 0)
+- registrar_dependentes(quantidade) - Número de dependentes
+- registrar_dividas(possui_dividas) - True ou False
+- calcular_novo_score(...) - Calcula o novo score
+- redirecionar_para_credito() - Para ver/solicitar limite
+- redirecionar_para_cambio() - Para cotação de moedas
+- encerrar_conversa(mensagem_despedida) - Encerra a conversa quando o cliente quiser sair
 
 REGRAS OBRIGATÓRIAS:
 1. Quando o cliente responder, SEMPRE: chame a tool + faça a PRÓXIMA pergunta na mesma resposta
@@ -139,13 +140,7 @@ Seja natural e objetivo. Responda em português do Brasil."""
                 "encerrar": False
             }
         
-        # Verifica cancelamento
-        if self._verificar_encerramento(mensagem):
-            return {
-                "resposta": "Entendido. A entrevista foi cancelada. Posso ajudá-lo com mais alguma coisa?",
-                "proximo_agente": None,
-                "encerrar": False
-            }
+        # Encerramento agora é controlado pelo LLM via tool encerrar_conversa
         
         try:
             # Monta prompt com contexto atual
@@ -154,13 +149,28 @@ Seja natural e objetivo. Responda em português do Brasil."""
                 dados_coletados=self._formatar_dados_coletados()
             )
             
+            # Verifica se Chain-of-Thought está ativado
+            cot_enabled = contexto.get("config", {}).get("chain_of_thought", False)
+            
             # Processa via LLM com tools
-            resposta_texto, tool_calls = self.processar_com_tools(
+            resposta_texto, tool_calls, encerrar_flag, mensagem_despedida = self.processar_com_tools(
                 prompt_sistema=prompt_sistema,
                 mensagem_usuario=mensagem,
                 contexto_debug="EntrevistaAgent.processar",
-                usar_memoria=True
+                usar_memoria=True,
+                chain_of_thought=cot_enabled
             )
+            
+            # Se a tool encerrar_conversa foi chamada, retorna imediatamente
+            if encerrar_flag:
+                self.adicionar_a_memoria(mensagem, mensagem_despedida or resposta_texto)
+                return {
+                    "resposta": mensagem_despedida or resposta_texto or "Foi um prazer ajudá-lo! Até logo!",
+                    "proximo_agente": None,
+                    "encerrar": True,
+                    "score_calculado": self.dados_entrevista.get("score_calculado"),
+                    "limite_maximo": self.dados_entrevista.get("limite_maximo")
+                }
             
             # Processa resultados das tools
             proximo_agente = None
@@ -210,25 +220,30 @@ Seja natural e objetivo. Responda em português do Brasil."""
                         self.cliente["score"] = result.get("novo_score")
                     print(f"[EntrevistaAgent] ✅ Score calculado: {result.get('novo_score')}")
             
-            # Se houve redirecionamento, não deixa resposta vazia
-            if proximo_agente:
-                # Não precisa de resposta - a transição deve ser invisível
-                return {
-                    "resposta": resposta_texto if resposta_texto else "",
-                    "proximo_agente": proximo_agente,
-                    "encerrar": False,
-                    "score_calculado": self.dados_entrevista.get("score_calculado"),
-                    "limite_maximo": self.dados_entrevista.get("limite_maximo")
-                }
-            
-            # Resposta final - usa resposta da LLM, ou fallback inteligente
+            # Monta resposta final - usa resposta da LLM, ou fallback inteligente
             if resposta_texto:
                 resposta_final = resposta_texto
             elif ultima_proxima_pergunta:
                 # Se a LLM não gerou texto mas houve tool call, usa a próxima pergunta
                 resposta_final = f"Registrado! {ultima_proxima_pergunta}"
+            elif self.dados_entrevista.get("score_calculado"):
+                # Score foi calculado - informa resultado
+                score = self.dados_entrevista["score_calculado"]
+                limite_max = self.dados_entrevista.get("limite_maximo", 0)
+                resposta_final = f"Seu novo score é {score} pontos! Com isso, você pode solicitar limite de até R$ {limite_max:,.2f}. Gostaria de solicitar um aumento?"
             else:
                 resposta_final = "Entendi! Como posso ajudar?"
+            
+            # Se houve redirecionamento, usa a resposta montada (não vazia!)
+            if proximo_agente:
+                self.adicionar_a_memoria(mensagem, resposta_final)
+                return {
+                    "resposta": resposta_final,
+                    "proximo_agente": proximo_agente,
+                    "encerrar": False,
+                    "score_calculado": self.dados_entrevista.get("score_calculado"),
+                    "limite_maximo": self.dados_entrevista.get("limite_maximo")
+                }
             
             self.adicionar_a_memoria(mensagem, resposta_final)
             

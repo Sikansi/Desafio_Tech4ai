@@ -25,6 +25,7 @@ if "orchestrator" not in st.session_state:
     st.session_state.orchestrator = Orchestrator(api_key=api_key)
     st.session_state.mensagens = []
     st.session_state.encerrado = False
+    st.session_state.chain_of_thought = False  # CoT desativado por padrão
 
 # Título e descrição
 st.title("🏦 Banco Ágil - Atendimento Virtual")
@@ -63,6 +64,19 @@ with st.sidebar:
                     st.success(f"**Score:** {resultado['score_calculado']} pontos")
                     if resultado.get("limite_maximo"):
                         st.info(f"**Limite Máximo:** R$ {resultado['limite_maximo']:,.2f}")
+    
+    st.markdown("---")
+    
+    # Toggle de Chain-of-Thought
+    st.header("⚙️ Configurações")
+    cot_enabled = st.toggle(
+        "💭 Chain-of-Thought",
+        value=st.session_state.get("chain_of_thought", False),
+        help="Quando ativado, o agente explica seu raciocínio antes de responder"
+    )
+    if cot_enabled != st.session_state.get("chain_of_thought", False):
+        st.session_state.chain_of_thought = cot_enabled
+        st.rerun()
     
     st.markdown("---")
     
@@ -115,17 +129,30 @@ with st.sidebar:
         if debug.get("contexto"):
             st.caption(f"📍 {debug['contexto']}")
         
-        # Tool calls
-        tool_calls = debug.get("tool_calls", [])
+        # Raciocínio (Chain-of-Thought) - mostra primeiro se houver
+        if debug.get("raciocinio"):
+            with st.expander("💭 Raciocínio (Chain-of-Thought)", expanded=True):
+                st.info(debug.get("raciocinio", ""))
+        
+        # Tool calls - usa tool_calls_completos se disponível (tem mais detalhes)
+        tool_calls = debug.get("tool_calls_completos", debug.get("tool_calls", []))
         if tool_calls:
             # Suporta tanto formato antigo (lista de strings) quanto novo (lista de dicts)
             if isinstance(tool_calls[0], dict):
-                tool_names = [tc.get("name", "unknown") for tc in tool_calls]
-                st.success(f"🔧 Tools: {', '.join(tool_names)}")
-                # Mostra detalhes das tool calls
-                with st.expander("🔧 Ver detalhes das Tool Calls", expanded=False):
-                    for tc in tool_calls:
-                        st.code(f"{tc.get('name', 'unknown')}({tc.get('args', {})})", language="python")
+                # Filtra responder_usuario (já mostrou o raciocínio acima)
+                other_tools = [tc for tc in tool_calls if tc.get("name") != "responder_usuario"]
+                
+                if other_tools:
+                    tool_names = [tc.get("name", "unknown") for tc in other_tools]
+                    st.success(f"🔧 Tools: {', '.join(tool_names)}")
+                    
+                    with st.expander("🔧 Ver detalhes das Tool Calls", expanded=False):
+                        for tc in other_tools:
+                            st.markdown(f"**{tc.get('name', 'unknown')}**")
+                            st.code(f"Args: {tc.get('args', {})}", language="python")
+                            if tc.get("result"):
+                                st.code(f"Result: {tc.get('result', {})}", language="python")
+                            st.markdown("---")
             else:
                 st.success(f"🔧 Tools: {', '.join(tool_calls)}")
         
@@ -194,9 +221,10 @@ else:
             "conteudo": mensagem_usuario
         })
         
-        # Processa mensagem
+        # Processa mensagem (passa config de Chain-of-Thought)
         with st.spinner("Processando..."):
-            resultado = st.session_state.orchestrator.processar_mensagem(mensagem_usuario)
+            cot_config = {"chain_of_thought": st.session_state.get("chain_of_thought", False)}
+            resultado = st.session_state.orchestrator.processar_mensagem(mensagem_usuario, config=cot_config)
         
         # Armazena informações de debug (acumula se já existir)
         if resultado.get("debug_info"):

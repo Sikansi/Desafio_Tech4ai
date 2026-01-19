@@ -13,10 +13,11 @@ class CambioAgent(BaseAgent):
     # Prompt de sistema que explica o contexto e responsabilidades
     SYSTEM_PROMPT = """Você é um assistente de câmbio de um banco digital.
 
-SUAS FERRAMENTAS (USE IMEDIATAMENTE - não prometa, EXECUTE):
-1. consultar_cotacao_moeda(moeda) - Consulta cotação de uma moeda
-2. redirecionar_para_credito() - Quando cliente quer falar sobre limite/crédito
-3. redirecionar_para_entrevista() - Quando cliente quer fazer entrevista
+FERRAMENTAS DISPONÍVEIS:
+- consultar_cotacao_moeda(moeda) - Consulta cotação de uma moeda
+- redirecionar_para_credito() - Para questões de limite/crédito
+- redirecionar_para_entrevista() - Para entrevista de crédito
+- encerrar_conversa(mensagem_despedida) - Encerra a conversa quando o cliente quiser sair
 
 MOEDAS DISPONÍVEIS:
 USD (Dólar), EUR (Euro), GBP (Libra), JPY (Iene), CHF (Franco Suíço), 
@@ -33,6 +34,12 @@ INSTRUÇÕES:
 - Cliente quer limite/crédito → use redirecionar_para_credito
 - "dólar" sem especificar → assume USD
 
+IMPORTANTE - NÃO INVENTAR FUNCIONALIDADES:
+- Você só pode fazer o que as FERRAMENTAS DISPONÍVEIS permitem
+- O sistema só oferece: consulta de cotação de moedas
+- NÃO existe compra/venda de moeda, transferência internacional, etc.
+- Se o cliente pedir algo que não existe, diga que não está disponível
+
 PROIBIDO:
 - NUNCA mencione "transferir", "outro agente", "outra área"
 - A transição deve ser INVISÍVEL - continue a conversa naturalmente
@@ -48,40 +55,64 @@ Seja natural e prestativo. Responda em português do Brasil."""
     def processar(self, mensagem: str, contexto: Dict[str, Any]) -> Dict[str, Any]:
         """Processa mensagem relacionada a câmbio"""
         
-        # Verifica encerramento
-        if self._verificar_encerramento(mensagem):
-            return {
-                "resposta": "Foi um prazer ajudá-lo! Até logo!",
-                "proximo_agente": None,
-                "encerrar": True
-            }
+        # Encerramento agora é controlado pelo LLM via tool encerrar_conversa
         
         try:
+            # Verifica se Chain-of-Thought está ativado
+            cot_enabled = contexto.get("config", {}).get("chain_of_thought", False)
+            
             # Processa usando Tool Calling
-            resposta_texto, tool_calls = self.processar_com_tools(
+            resposta_texto, tool_calls, encerrar_flag, mensagem_despedida = self.processar_com_tools(
                 prompt_sistema=self.SYSTEM_PROMPT,
                 mensagem_usuario=mensagem,
                 contexto_debug="CambioAgent.processar",
-                usar_memoria=True
+                usar_memoria=True,
+                chain_of_thought=cot_enabled
             )
             
-            # Verifica se houve redirecionamento
-            for tc in tool_calls:
-                if tc["name"] == "redirecionar_para_credito":
-                    return {
-                        "resposta": "",
-                        "proximo_agente": "credito",
-                        "encerrar": False
-                    }
-                elif tc["name"] == "redirecionar_para_entrevista":
-                    return {
-                        "resposta": "",
-                        "proximo_agente": "entrevista",
-                        "encerrar": False
-                    }
+            # Se a tool encerrar_conversa foi chamada, retorna imediatamente
+            if encerrar_flag:
+                self.adicionar_a_memoria(mensagem, mensagem_despedida or resposta_texto)
+                return {
+                    "resposta": mensagem_despedida or resposta_texto or "Foi um prazer ajudá-lo! Até logo!",
+                    "proximo_agente": None,
+                    "encerrar": True
+                }
             
-            # Usa a resposta do LLM diretamente
-            resposta_final = resposta_texto if resposta_texto else "Qual moeda você gostaria de consultar?"
+            # Processa tool calls - primeiro coleta tudo
+            proximo_agente = None
+            ultima_mensagem_tool = None
+            
+            for tc in tool_calls:
+                print(f"[CambioAgent] Tool executada: {tc['name']} -> {tc['result']}")
+                
+                if tc["name"] == "redirecionar_para_credito":
+                    proximo_agente = "credito"
+                elif tc["name"] == "redirecionar_para_entrevista":
+                    proximo_agente = "entrevista"
+                elif tc["name"] == "consultar_cotacao_moeda":
+                    result = tc["result"]
+                    if isinstance(result, dict) and result.get("sucesso"):
+                        ultima_mensagem_tool = result.get("mensagem", "")
+            
+            # Monta resposta final
+            if resposta_texto:
+                resposta_final = resposta_texto
+            elif ultima_mensagem_tool:
+                resposta_final = ultima_mensagem_tool
+            elif tool_calls:
+                resposta_final = "Cotação consultada!"
+            else:
+                resposta_final = "Qual moeda você gostaria de consultar?"
+            
+            # Se houve redirecionamento, usa a resposta (não vazia!)
+            if proximo_agente:
+                self.adicionar_a_memoria(mensagem, resposta_final)
+                return {
+                    "resposta": resposta_final,
+                    "proximo_agente": proximo_agente,
+                    "encerrar": False
+                }
             
             # Salva na memória
             self.adicionar_a_memoria(mensagem, resposta_final)
